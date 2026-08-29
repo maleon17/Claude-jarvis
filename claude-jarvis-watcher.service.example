@@ -1,0 +1,23 @@
+[Unit]
+Description=Claude Jarvis backend worker
+Documentation=https://github.com/maleon17/Claude-jarvis
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__INSTALL_DIR__
+Environment=PATH=/home/__USER__/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=CLAUDE_JARVIS_MCP_CONFIG=__INSTALL_DIR__/mcp_telegram_tools_config.json
+Environment=CLAUDE_JARVIS_ASK_QUEUE=/tmp/hermes_ask_queue/
+Environment=CLAUDE_JARVIS_ASK_RESULT=/tmp/hermes_ask_result/
+ExecStart=/usr/bin/python3 -u __INSTALL_DIR__/claude_watcher.py
+Restart=always
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=20
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

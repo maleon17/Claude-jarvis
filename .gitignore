@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+mcp_telegram_tools_config.json
+ask_sessions*.enc
+ask_sessions*.json
+.session_key_*
+accounts/
+runtime/
+uploads_*/
+*.log
+*.processing
+*.service

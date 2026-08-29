@@ -1,0 +1,21 @@
+[Unit]
+Description=Claude Jarvis shared HTTP queue relay
+Documentation=https://github.com/maleon17/Claude-jarvis
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__INSTALL_DIR__
+Environment=PATH=/home/__USER__/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=JARVIS_ASK_DIR=__INSTALL_DIR__/runtime
+ExecStart=/usr/bin/python3 -u __INSTALL_DIR__/cmd_queue.py
+Restart=always
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=20
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

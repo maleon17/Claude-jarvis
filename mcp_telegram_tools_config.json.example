@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "telegram_actions": {
+      "command": "__MCP_PYTHON__",
+      "args": ["__INSTALL_DIR__/mcp_telegram_tools.py"]
+    }
+  }
+}

@@ -49,11 +49,16 @@ from .._internal import fw_protect
 # Tailscale Funnel URL, which this userbot host's outbound path to the
 # funnel's edge IP range stopped completing TLS handshakes on (verified:
 # general internet fine, only that specific edge range affected).
-FUNNEL = os.environ.get("CLAUDE_JARVIS_FUNNEL", "http://127.0.0.1:9092")
+FUNNEL = os.environ.get("CLAUDE_JARVIS_FUNNEL", "http://100.98.146.81:9092")
 
-# A userspace Tailscale deployment can provide an HTTP CONNECT proxy. It is
-# opt-in so a local queue relay works without a Tailscale daemon as well.
-HTTP_PROXY = os.environ.get("CLAUDE_JARVIS_HTTP_PROXY", "")
+# tailscaled on this userbot host runs with --tun=userspace-networking (no
+# /dev/net/tun in this container), so a plain socket connection never
+# reaches the tailnet at all -- everything has to go through its local HTTP
+# CONNECT proxy (--outbound-http-proxy-listen=localhost:1056). This is NOT
+# optional for this deployment: without it, FUNNEL above (a tailnet IP) is
+# simply unreachable and every /ask request silently vanishes. Still
+# overridable/disableable via env var for a future host that doesn't need it.
+HTTP_PROXY = os.environ.get("CLAUDE_JARVIS_HTTP_PROXY", "http://localhost:1056")
 if HTTP_PROXY:
     urllib.request.install_opener(
         urllib.request.build_opener(urllib.request.ProxyHandler({"http": HTTP_PROXY}))
@@ -79,6 +84,10 @@ THINKING_SPINNER_FRAMES = "⠋⠙⠚⠞⠖⠦⠴⠲⠳⠓"
 # generous free tier per the owner directly). Confirmed against Mistral's own
 # docs 2026-08-05, not guessed: POST multipart/form-data, model
 # voxtral-mini-latest, response JSON's "text" field holds the transcript.
+# No hardcoded default on purpose (this repo is a public git remote, unlike
+# ~/.claude-telegram-bridge/jarvis-ask/) -- set the real key via env var, or
+# patch this line locally without committing it, before (re)deploying via .lm.
+# Real key: see BRIDGE_PROJECT_HANDOFF.md's Mistral/Voxtral section.
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "")
 MISTRAL_TRANSCRIBE_URL = "https://api.mistral.ai/v1/audio/transcriptions"
 
@@ -1512,6 +1521,17 @@ class ClaudeAsk(loader.Module):
         is_numeric = target.lstrip("-").isdigit()
         is_username = target.startswith("@")
         needle = (target[1:] if is_username else target).lower()
+        # Prefer a title already associated with stored triggers. Telegram
+        # may contain multiple dialogs with the same display title; picking
+        # the first generic dialog can otherwise select an unrelated chat
+        # and falsely report that the requested trigger set is empty.
+        if not is_numeric and not is_username:
+            for cid in self._get_triggers():
+                try:
+                    if (await self._chat_label(int(cid))).lower() == needle:
+                        return int(cid)
+                except Exception:
+                    continue
         try:
             async for d in self._client.iter_dialogs():
                 ent = d.entity
@@ -2935,10 +2955,21 @@ class ClaudeAsk(loader.Module):
         # parse, _safe_edit swallows the exception), which is why a chain
         # of several thoughts could end up showing only the last one (or
         # none) instead of one blockquote per thought as intended.
+        # `answer` is the model's own HTML and is explicitly allowed to use
+        # <blockquote> itself (see the persona's allowed-tags list) -- it
+        # used to be wrapped in an outer <blockquote> here too, and Telegram
+        # doesn't support nested blockquotes: whenever the model's answer
+        # legitimately quoted something, the FIRST </blockquote> Telegram
+        # saw (closing the model's inner one) got matched to the OUTER
+        # opening tag instead, silently absorbing everything in between
+        # into one quote block and dropping the real trailing content
+        # outside any quote at all. Not wrapping the answer avoids the
+        # conflict entirely; the recap lines above it still use blockquote
+        # normally since they never contain model-authored HTML.
         recap = "".join(f"\n<blockquote>🤔 {_h(t)}</blockquote>" for t in thoughts)
         await self._safe_edit(
             work_message,
-            f"<blockquote>💬 {_h(orig_question)}</blockquote>{recap}\n<blockquote>🤖 {answer}</blockquote>",
+            f"<blockquote>💬 {_h(orig_question)}</blockquote>{recap}\n🤖 {answer}",
             parse_mode="html",
         )
 

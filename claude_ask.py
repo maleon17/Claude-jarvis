@@ -39,7 +39,7 @@ from herokutl.tl.functions.contacts import (
 from herokutl.tl.types import (
     MessageEntityUrl, MessageEntityTextUrl, Channel, ChannelParticipantsAdmins, Message,
 )
-from herokutl.errors import UserPrivacyRestrictedError, UserNotParticipantError
+from herokutl.errors import FloodWaitError, UserPrivacyRestrictedError, UserNotParticipantError
 
 from .. import loader, utils
 from .._internal import fw_protect
@@ -69,6 +69,7 @@ if HTTP_PROXY:
 # between the two clients now that the backend's session-file naming no
 # longer special-cases this instance either (2026-08-04 symmetry pass).
 INSTANCE_ID = os.environ.get("CLAUDE_JARVIS_INSTANCE_ID", "andrey")
+ENGINE = "claude"
 MAX_ROUNDS = 5  # mirrors claude_watcher.py's own round discipline
 POLL_TIMEOUT_S = 600  # agentic file-editing tasks can genuinely take a while
 # Braille-spinner "thinking" animation (edit-driven, ~0.5s cadence) -- PRIVATE
@@ -407,38 +408,41 @@ class ClaudeAsk(loader.Module):
         return await message.respond("⏳")
 
     async def _safe_edit(self, message, text, parse_mode=None):
-        try:
-            cur = getattr(message, "text", "") or getattr(message, "raw_text", "")
-            if cur != text:
-                if parse_mode:
-                    try:
-                        await message.edit(text, parse_mode=parse_mode)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        # Malformed HTML (e.g. an unescaped '<' buried in a
-                        # long model answer -- _dispatch_answer's answer
-                        # text isn't run through _h(), it's trusted as
-                        # already-valid HTML per the persona's own
-                        # instructions, but that trust isn't always
-                        # warranted) makes Telegram reject the parse
-                        # outright. Previously this silently discarded the
-                        # WHOLE edit, permanently freezing the message on
-                        # whatever was showing before -- often a stale
-                        # progress/spinner frame with no indication the
-                        # real answer ever arrived (confirmed live
-                        # 2026-08-27: a long-form answer got stuck on its
-                        # own "✍️" progress preview forever). Falling back
-                        # to a plain-text send guarantees the real content
-                        # reaches the user even if the tags show up raw --
-                        # ugly beats silently missing.
+        """Edit one existing work message and never create a replacement.
+
+        A transient edit FloodWait is awaited and retried on this same
+        message.  For malformed HTML we retry once without a parse mode.
+        Sending a reply here is deliberately forbidden: it leaves the old
+        ``Thinking`` bubble orphaned and makes the final answer appear as a
+        second message.
+        """
+        cur = getattr(message, "text", "") or getattr(message, "raw_text", "")
+        if cur == text:
+            return message
+
+        modes = [parse_mode] if not parse_mode else [parse_mode, None]
+        for mode in modes:
+            for attempt in range(2):
+                try:
+                    if mode:
+                        await message.edit(text, parse_mode=mode)
+                    else:
                         await message.edit(text)
-                else:
-                    await message.edit(text)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            pass
+                    return message
+                except asyncio.CancelledError:
+                    raise
+                except FloodWaitError as exc:
+                    if attempt:
+                        break
+                    # Telegram tells us how long this account must wait;
+                    # honour it instead of replying with a second message.
+                    delay = max(1, int(getattr(exc, "seconds", 1) or 1))
+                    await asyncio.sleep(delay)
+                except Exception:
+                    # A parse-mode failure gets the plain-edit retry above;
+                    # other failures leave the same message untouched.
+                    break
+        return message
 
     async def _get_reply_text(self, message):
         rid = getattr(message, "reply_to_msg_id", None)
@@ -928,10 +932,12 @@ class ClaudeAsk(loader.Module):
     async def _poll_progress_and_result(self, message, req_id, animate=False):
         """Live-edits `message` with claude_watcher's streamed progress
         (thought/tool-call blocks) until it signals done, then returns
-        (answer, thoughts) -- thoughts is the list of intermediate
+        (message, answer, thoughts) -- thoughts is the list of intermediate
         reasoning steps banked by claude_watcher.py (each one that was
-        followed by a tool call), for the final recap. Returns (None, [])
-        on timeout.
+        followed by a tool call), for the final recap. Returns
+        (message, None, []) on timeout. The message is returned alongside
+        the result so every caller keeps one explicit work-message state;
+        `_safe_edit` never replaces it with a reply.
 
         `animate=True` (private chats only, see THINKING_SPINNER_FRAMES)
         cycles a Braille-spinner frame into `message` at ~0.5s cadence
@@ -986,16 +992,16 @@ class ClaudeAsk(loader.Module):
             if d.get("request_id") is not None and d.get("request_id") != req_id:
                 continue
             if d.get("done"):
-                return d.get("answer"), (d.get("thoughts") or [])
+                return message, d.get("answer"), (d.get("thoughts") or [])
             progress = d.get("progress")
             if progress and progress != last_progress:
-                await self._safe_edit(message, progress, parse_mode="html")
+                message = await self._safe_edit(message, progress, parse_mode="html")
                 last_progress = progress
             elif animate and not last_progress:
                 frame = THINKING_SPINNER_FRAMES[frame_i % len(THINKING_SPINNER_FRAMES)]
                 frame_i += 1
-                await self._safe_edit(message, f"{_h(frame)} Thinking", parse_mode="html")
-        return None, []
+                message = await self._safe_edit(message, f"{_h(frame)} Thinking", parse_mode="html")
+        return message, None, []
 
     # The last of the text markers (SEARCH_CHAT/READ_HISTORY/LIST_TRIGGERS)
     # moved to real MCP tools 2026-08-11 -- see search_chat/read_history/
@@ -1648,6 +1654,9 @@ class ClaudeAsk(loader.Module):
             return None, "action=agent требует instruction"
         if action == "post" and not spec.get("target"):
             return None, "action=post требует target"
+        engine = str(spec.get("engine") or ENGINE).lower()
+        if engine not in ("claude", "codex"):
+            return None, f"некорректный engine: {engine} (ожидался claude или codex)"
         value = spec.get("value")
         if kind == "keyword" and isinstance(value, str):
             value = [value]
@@ -1670,6 +1679,7 @@ class ClaudeAsk(loader.Module):
             "kind": kind,
             "value": value,
             "action": action,
+            "engine": engine,
             "verify": spec.get("verify"),
             "instruction": spec.get("instruction"),
             "reply_text": spec.get("reply_text"),
@@ -1801,19 +1811,36 @@ class ClaudeAsk(loader.Module):
 
     async def _list_triggers(self, chat_arg, chat_id):
         """Real list_triggers MCP tool handler (was the LIST_TRIGGERS text
-        marker, part of the old round-trip family)."""
+        marker, part of the old round-trip family).
+
+        chat="" or "this" means the CURRENT chat -- same convention as
+        register_trigger/edit_trigger's own chat handling. An explicit
+        "all"/"everywhere"/"все" is required for the old global-listing
+        behaviour. Previously empty meant "every chat", silently disagreeing
+        with every other trigger tool's "empty = this chat" convention --
+        a real live mix-up (2026-08-29, caught on the CodexAsk twin of this
+        file first): asked for "triggers in this chat", got a plausible-
+        looking list back for a DIFFERENT chat with no error, because the
+        model reasonably reused register_trigger's own "empty = here" rule."""
         triggers = self._get_triggers()
-        if chat_arg:
+        chat_norm = (chat_arg or "").strip().lower()
+        if chat_norm in ("all", "everywhere", "все", "везде", "всех", "любой", "любые"):
+            items = [(cid, t) for cid, trigs in triggers.items() for t in trigs]
+        else:
             chat_target = await self._resolve_any_chat_target(chat_arg, chat_id)
             items = [(chat_target, t) for t in triggers.get(str(chat_target), [])] if chat_target is not None else []
-        else:
-            items = [(cid, t) for cid, trigs in triggers.items() for t in trigs]
         if not items:
             return "Активных триггеров нет."
         lines = []
         for cid, t in items:
-            chat_label = await self._chat_label(int(cid))
-            line = f"- id={t['id']}, чат «{chat_label}», {t['kind']} → {t['action']}: {t.get('label', '')}"
+            # cid comes straight from a stored dict key here (not from a
+            # freshly resolved entity id) -- a malformed/empty key must
+            # still be listed, not crash the whole call.
+            try:
+                chat_label = await self._chat_label(int(cid))
+            except (ValueError, TypeError):
+                chat_label = f"НЕИЗВЕСТНЫЙ ЧАТ (битый ключ {cid!r})"
+            line = f"- id={t['id']}, [{t.get('engine', 'claude')}] чат «{chat_label}», {t['kind']} → {t['action']}: {t.get('label', '')}"
             exempt_bits = []
             if t.get("only_senders"):
                 exempt_bits.append("только от: " + ", ".join(t["only_senders"]))
@@ -1864,7 +1891,7 @@ class ClaudeAsk(loader.Module):
         )
         return f"✅ Удалено сообщений: {len(ids)}."
 
-    async def _classify_condition(self, condition, text):
+    async def _classify_condition(self, condition, text, allow_fallback=True):
         """Tier 1: 3-way ("yes"/"no"/"unsure") classification via
         cmd_queue.py's /classify, which routes to claude_watcher.py's
         mode='classify' (`claude -p --model haiku`, flat subscription, not
@@ -1873,9 +1900,17 @@ class ClaudeAsk(loader.Module):
         not free like keyword/link/button -- used for kind='semantic'
         triggers (rare, per the persona) AND as the verify-gate for
         keyword-prefiltered triggers (see _resolve_verified_action).
-        "unsure" is a real third outcome, not an error state -- any
-        request failure/timeout also collapses to "unsure" (fail safe:
-        escalate to a human rather than silently act or silently ignore)."""
+        "unsure" is a real third outcome, not an error state.
+
+        cmd_queue.py's classify_semantic can also return a distinct
+        "__unavailable__" sentinel (CLASSIFY_UNAVAILABLE there) instead of
+        a real verdict -- that means the call itself never got an answer
+        (queue write failed, or the timeout hit with no result, often the
+        account's flat-subscription limit), NOT that the model looked and
+        was genuinely unsure. A local network failure to /classify itself
+        is treated the same way. Added 2026-08-30, same fallback pattern
+        _do_ask/_fire_agent_action already use: retry once via the sibling
+        engine's own classify before ever reporting "unsure" to a caller."""
         if not condition or not text:
             return "unsure"
         loop = asyncio.get_running_loop()
@@ -1891,9 +1926,17 @@ class ClaudeAsk(loader.Module):
 
         try:
             result = await loop.run_in_executor(None, call)
-            return result.get("result") or "unsure"
+            verdict = result.get("result") or "unsure"
         except Exception:
+            verdict = "__unavailable__"
+
+        if verdict == "__unavailable__":
+            if allow_fallback:
+                fallback = self._fallback_backend()
+                if fallback is not None:
+                    return await fallback._classify_condition(condition, text, allow_fallback=False)
             return "unsure"
+        return verdict
 
     async def _resolve_verified_action(self, trig, message):
         """A keyword/link/button match already happened (cheap, free) --
@@ -1993,7 +2036,19 @@ class ClaudeAsk(loader.Module):
             return True
         return False
 
-    async def _fire_reply_via_agent(self, trig, message, chat_label, sender):
+    def _fallback_backend(self):
+        try:
+            return self.lookup("JarvisAsk").fallback(ENGINE)
+        except Exception:
+            return None
+
+    def _backend_failed(self, answer):
+        try:
+            return self.lookup("JarvisAsk").is_failure(answer)
+        except Exception:
+            return False
+
+    async def _fire_reply_via_agent(self, trig, message, chat_label, sender, allow_fallback=True):
         """No canned reply_text -- composing an actually-appropriate reply
         is a generation task, not a lookup, so this is the one trigger
         path that spawns a real Tier 2 agentic call (same queue/poll
@@ -2013,6 +2068,11 @@ class ClaudeAsk(loader.Module):
         async with self._agent_trigger_lock(message.chat_id):
             req_id = str(uuid.uuid4())
             if not self._enqueue(question, message.chat_id, req_id, "chat"):
+                fallback = self._fallback_backend() if allow_fallback else None
+                if fallback is not None:
+                    return await fallback._fire_reply_via_agent(
+                        trig, message, chat_label, sender, allow_fallback=False,
+                    )
                 return
             answer = None
             for _ in range(60):
@@ -2024,7 +2084,12 @@ class ClaudeAsk(loader.Module):
                 if isinstance(d, dict) and d.get("request_id") == req_id and d.get("done"):
                     answer = d.get("answer")
                     break
-        if not answer:
+        if not answer or self._backend_failed(answer):
+            fallback = self._fallback_backend() if allow_fallback else None
+            if fallback is not None:
+                return await fallback._fire_reply_via_agent(
+                    trig, message, chat_label, sender, allow_fallback=False,
+                )
             await self._notify_topic("moderation", "⚠️ Автоответ по триггеру не дождался ответа агента.")
             return
         try:
@@ -2145,7 +2210,7 @@ class ClaudeAsk(loader.Module):
                 f"⚠️ Триггер [{_h(trig.get('id', '?'))}] action=post не смог отправить алерт: {_h(result)}",
             )
 
-    async def _fire_agent_action(self, trig, message, chat_label, sender):
+    async def _fire_agent_action(self, trig, message, chat_label, sender, allow_fallback=True):
         """action='agent': the owner's own instruction, set once at
         register_trigger time, carried out by a full Tier 2 agentic call
         with access to the ENTIRE tool surface (send_message incl. chat_id/
@@ -2193,9 +2258,19 @@ class ClaudeAsk(loader.Module):
             self._agent_turn_sent[str(message.chat_id)] = False
             req_id = str(uuid.uuid4())
             if not self._enqueue(prompt, message.chat_id, req_id, "chat"):
+                fallback = self._fallback_backend() if allow_fallback else None
+                if fallback is not None:
+                    return await fallback._fire_agent_action(
+                        trig, message, chat_label, sender, allow_fallback=False,
+                    )
                 return
             answer, thoughts = await self._poll_result_silent(req_id)
-            if answer is None:
+            if answer is None or self._backend_failed(answer):
+                fallback = self._fallback_backend() if allow_fallback else None
+                if fallback is not None:
+                    return await fallback._fire_agent_action(
+                        trig, message, chat_label, sender, allow_fallback=False,
+                    )
                 await self._notify_topic(
                     "moderation", f"⚠️ Триггер [{_h(trig.get('id', '?'))}] (agent) не дождался ответа.",
                 )
@@ -2527,7 +2602,21 @@ class ClaudeAsk(loader.Module):
         'Event' object has no attribute 'entities', from a kind=link
         trigger's chat receiving some non-message event. Guarding once
         here, at the single entry point every trigger kind/action funnels
-        through, beats patching each individual attribute access."""
+        through, beats patching each individual attribute access.
+
+        Delegates to the shared JarvisAsk coordinator (2026-08-30) so a
+        trigger tagged engine="codex" isn't also evaluated (and verify-
+        classified via the wrong model) here -- see jarvis_ask.py's
+        handle_message. Falls back to the pre-coordinator direct loop
+        (unfiltered by engine) only if that module somehow isn't loaded,
+        so triggers still fire rather than going silently dead."""
+        try:
+            coordinator = self.lookup("JarvisAsk")
+        except Exception:
+            coordinator = None
+        if coordinator is not None:
+            await coordinator.handle_message(message, ENGINE, self)
+            return
         if not isinstance(message, Message):
             return
         if message.out:
@@ -2537,6 +2626,8 @@ class ClaudeAsk(loader.Module):
             return
         resolved = []
         for t in chat_triggers:
+            if str(t.get("engine") or "claude").lower() != ENGINE:
+                continue
             if await self._is_trigger_exempt(t, message):
                 continue
             if not await self._trigger_matches(t, message):
@@ -2800,7 +2891,10 @@ class ClaudeAsk(loader.Module):
 
     # -- Main ask loop --------------------------------------------------------
 
-    async def _do_ask(self, message, question, mode="chat", orig_question=None, round_num=0, work_message=None):
+    async def _do_ask(
+        self, message, question, mode="chat", orig_question=None, round_num=0,
+        work_message=None, allow_fallback=True,
+    ):
         """`message` is always the ORIGINAL trigger -- reply-to/history
         context is read from it. `work_message` is what actually gets
         edited; resolved once via `_work_message()` on the first round and
@@ -2868,20 +2962,11 @@ class ClaudeAsk(loader.Module):
         chat_id = message.chat_id
         req_id = str(uuid.uuid4())
 
-        # Private chats get the Braille-spinner cycling animation
-        # (THINKING_SPINNER_FRAMES, via _poll_progress_and_result's
-        # `animate=True`); groups keep the static placeholder unchanged.
-        # See THINKING_SPINNER_FRAMES' own comment for why the split
-        # matters: a ticking edit-animation is what got this account
-        # banned from a GROUP once, so it's confined to 1:1 chats only --
-        # a deliberate, informed choice by the owner, not an oversight.
-        animate = bool(message.is_private)
-        if animate:
-            await self._safe_edit(
-                work_message, f"{_h(THINKING_SPINNER_FRAMES[0])} Thinking", parse_mode="html",
-            )
-        else:
-            await self._safe_edit(work_message, "🤔 Thinking", parse_mode="html")
+        # Keep one stable placeholder until real thought/tool progress
+        # arrives.  A half-second edit spinner trips Telegram's edit limit,
+        # which used to make the fallback send a second message.
+        animate = False
+        work_message = await self._safe_edit(work_message, "🤔 Думаю", parse_mode="html")
 
         # Telegram's own native "typing..." chat action, NOT a message-edit
         # animation -- a completely different mechanism from the banned
@@ -2911,9 +2996,22 @@ class ClaudeAsk(loader.Module):
         # chat-access requirement, not a formatting/schema issue.
         answer, thoughts = [None, []]
         topic_id = self._topic_of(message)
+        enqueued = False
         async with self._client.action(chat_id, "typing"):
             if self._enqueue(question, chat_id, req_id, mode, topic_id=topic_id, exclude_id=work_message.id):
-                answer, thoughts = await self._poll_progress_and_result(work_message, req_id, animate=animate)
+                enqueued = True
+                work_message, answer, thoughts = await self._poll_progress_and_result(
+                    work_message, req_id, animate=animate,
+                )
+
+        if allow_fallback and (not enqueued or self._backend_failed(answer)):
+            fallback = self._fallback_backend()
+            if fallback is not None:
+                return await fallback._do_ask(
+                    message, question, mode=mode, orig_question=orig_question,
+                    round_num=round_num, work_message=work_message,
+                    allow_fallback=False,
+                )
 
         if answer is None:
             await self._safe_edit(
@@ -2952,9 +3050,9 @@ class ClaudeAsk(loader.Module):
         # _h(t): thoughts are raw model scratch text, NOT guaranteed valid
         # HTML like the final answer is -- an unescaped '<' here used to
         # corrupt this whole edit's entity structure (Telegram rejects the
-        # parse, _safe_edit swallows the exception), which is why a chain
-        # of several thoughts could end up showing only the last one (or
-        # none) instead of one blockquote per thought as intended.
+        # parse, _safe_edit keeps the existing message unchanged), which is
+        # why a chain of several thoughts could end up showing only the last
+        # one (or none) instead of one blockquote per thought as intended.
         # `answer` is the model's own HTML and is explicitly allowed to use
         # <blockquote> itself (see the persona's allowed-tags list) -- it
         # used to be wrapped in an outer <blockquote> here too, and Telegram
@@ -3002,7 +3100,7 @@ class ClaudeAsk(loader.Module):
         if not kw:
             await self._safe_edit(work_message, "⚠️ <b>.search</b> &lt;слово&gt;", parse_mode="html")
             return
-        await self._safe_edit(work_message, f"🔍 Ищу «{kw}»...")
+        work_message = await self._safe_edit(work_message, f"🔍 Ищу «{kw}»...")
         try:
             results = await self._search_chat(message.chat_id, kw, topic_id=self._topic_of(message))
         except Exception as e:

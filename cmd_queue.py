@@ -71,6 +71,17 @@ TOOL_RESULT_DIR = os.environ.get("JARVIS_TOOL_RESULT_DIR", "/tmp/hermes_tool_res
 os.makedirs(TOOL_QUEUE_DIR, exist_ok=True)
 os.makedirs(TOOL_RESULT_DIR, exist_ok=True)
 _TOOL_QUEUE_LOCK = threading.Lock()
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_SAFE_INSTANCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+
+
+def _safe_request_id(value):
+    return isinstance(value, str) and bool(_SAFE_ID_RE.fullmatch(value))
+
+
+def _safe_instance_id(value):
+    return isinstance(value, str) and bool(_SAFE_INSTANCE_RE.fullmatch(value))
 
 
 def _pop_pending_tool_call(instance_id: str):
@@ -173,6 +184,8 @@ def classify_semantic(text: str, condition: str, timeout: float = 25.0) -> str:
 
 def ocr_image(b64: str, question: str = "Извлеки весь текст с этого изображения.") -> str | None:
     """OCR via OpenRouter vision model"""
+    if not OPENROUTER_KEY:
+        return "OCR unavailable: OPENROUTER_API_KEY is not configured"
     try:
         data = json.dumps({
             "model": "openai/gpt-4o-mini",
@@ -208,11 +221,27 @@ class Queue(BaseHTTPRequestHandler):
                 self.send_response(400)
                 self.end_headers()
                 return
-            content_length = int(self.headers.get("Content-Length", 0))
+            try:
+                content_length = int(self.headers.get("Content-Length", 0))
+            except (TypeError, ValueError):
+                self._json({"status": "error", "message": "Некорректный Content-Length"})
+                return
+            if content_length < 0 or content_length > MAX_UPLOAD_BYTES:
+                self._json({"status": "error", "message": "Файл слишком большой"})
+                return
             body_raw = self.rfile.read(content_length)
             # Find filename in Content-Disposition
             fname_match = re.search(rb'filename="([^"]+)"', body_raw)
-            fname = fname_match.group(1).decode() if fname_match else "uploaded_file"
+            raw_fname = fname_match.group(1).decode("utf-8", "replace") if fname_match else "uploaded_file"
+            normalized_fname = raw_fname.replace("\\", "/")
+            fname = os.path.basename(normalized_fname)
+            if (
+                not fname or fname in (".", "..") or "\x00" in fname
+                or ".." in normalized_fname.split("/")
+            ):
+                self._json({"status": "error", "message": "Некорректное имя файла"})
+                return
+            fname = fname[:180]
             # Find the binary part (after \r\n\r\n after the Content-Type line)
             parts = body_raw.split(b"\r\n\r\n", 2)
             if len(parts) >= 3:
@@ -221,7 +250,10 @@ class Queue(BaseHTTPRequestHandler):
                 file_data = parts[1].rsplit(b"\r\n--", 1)[0]
             else:
                 file_data = b""
-            save_path = os.path.join("/tmp", fname)
+            # Do not let a client overwrite a predictable /tmp file (or a
+            # file uploaded by another request).  The returned path is the
+            # only name downstream needs for the subsequent /download call.
+            save_path = os.path.join("/tmp", f"jarvis_upload_{uuid.uuid4().hex}_{fname}")
             with open(save_path, "wb") as f:
                 f.write(file_data)
             self._json({"status": "ok", "path": save_path, "filename": fname})
@@ -241,15 +273,18 @@ class Queue(BaseHTTPRequestHandler):
 
         elif self.path in ("/ask", "/xask"):
             req_id = body.get("request_id", "")
-            if not req_id:
-                self._json({"status": "error", "message": "Нет request_id"})
+            if not _safe_request_id(req_id):
+                self._json({"status": "error", "message": "Некорректный request_id"})
                 return
             ask_data = {
                 "question": body.get("question", ""),
                 "ts": time.time(),
                 "done": False,
             }
-            for k in ("chat_id", "request_id", "message_id", "topic_id", "mode", "instance_id"):
+            for k in (
+                "chat_id", "request_id", "message_id", "topic_id", "mode",
+                "instance_id", "requester_id",
+            ):
                 if k in body:
                     ask_data[k] = body[k]
             queue_dir = XASK_QUEUE_DIR if self.path == "/xask" else ASK_QUEUE_DIR
@@ -259,14 +294,15 @@ class Queue(BaseHTTPRequestHandler):
 
         elif self.path == "/tool_call":
             req_id = body.get("request_id", "")
-            if not req_id:
-                self._json({"status": "error", "message": "Нет request_id"})
+            if not _safe_request_id(req_id):
+                self._json({"status": "error", "message": "Некорректный request_id"})
                 return
             call_data = {
                 "instance_id": body.get("instance_id", ""),
                 "chat_id": body.get("chat_id", ""),
                 "tool": body.get("tool", ""),
                 "args": body.get("args", {}),
+                "requester_id": body.get("requester_id"),
                 "ts": time.time(),
             }
             with open(os.path.join(TOOL_QUEUE_DIR, f"{req_id}.json"), "w") as f:
@@ -275,8 +311,8 @@ class Queue(BaseHTTPRequestHandler):
 
         elif self.path == "/tool_call_result":
             req_id = body.get("request_id", "")
-            if not req_id:
-                self._json({"status": "error", "message": "Нет request_id"})
+            if not _safe_request_id(req_id):
+                self._json({"status": "error", "message": "Некорректный request_id"})
                 return
             with open(os.path.join(TOOL_RESULT_DIR, f"{req_id}.json"), "w") as f:
                 json.dump({"done": True, "result": body.get("result", "")}, f)
@@ -298,10 +334,10 @@ class Queue(BaseHTTPRequestHandler):
         elif self.path == "/xreset":
             chat_id = body.get("chat_id", "")
             instance_id = body.get("instance_id") or "andrey_codex"
-            if not chat_id:
-                self._json({"status": "error", "message": "Нет chat_id"})
+            if not chat_id or not _safe_instance_id(instance_id):
+                self._json({"status": "error", "message": "Некорректные chat_id или instance_id"})
                 return
-            reset_id = f"{instance_id}_{chat_id}_{uuid.uuid4().hex}"
+            reset_id = f"reset_{uuid.uuid4().hex}"
             with open(os.path.join(XASK_RESET_DIR, reset_id + ".json"), "w") as f:
                 json.dump({"chat_id": str(chat_id), "instance_id": instance_id}, f)
             self._json({"status": "ok", "message": f"Codex-сессия чата {chat_id} будет сброшена"})
@@ -324,6 +360,9 @@ class Queue(BaseHTTPRequestHandler):
                 # contact. Missing/default instance_id keeps the original
                 # filename so the existing deployed client needs no change.
                 instance_id = body.get("instance_id") or "andrey"
+                if not _safe_instance_id(instance_id):
+                    self._json({"status": "error", "message": "Некорректный instance_id"})
+                    return
                 sessions_file = _sessions_enc_file(instance_id)
                 cleared = False
                 if os.path.exists(sessions_file):
@@ -422,8 +461,8 @@ class Queue(BaseHTTPRequestHandler):
             qs = urllib.parse.urlparse(self.path).query
             req_id = urllib.parse.parse_qs(qs).get("request_id", [""])[0]
             result_dir = XASK_RESULT_DIR if self.path.startswith("/xask") else ASK_RESULT_DIR
-            result_path = os.path.join(result_dir, f"{req_id}.json")
-            if req_id and os.path.exists(result_path):
+            result_path = os.path.join(result_dir, f"{req_id}.json") if _safe_request_id(req_id) else None
+            if result_path and os.path.exists(result_path):
                 try:
                     with open(result_path) as f:
                         data = json.load(f)
@@ -449,8 +488,8 @@ class Queue(BaseHTTPRequestHandler):
             # posts back via POST /tool_call_result.
             qs = urllib.parse.urlparse(self.path).query
             req_id = urllib.parse.parse_qs(qs).get("request_id", [""])[0]
-            result_path = os.path.join(TOOL_RESULT_DIR, f"{req_id}.json")
-            if req_id and os.path.exists(result_path):
+            result_path = os.path.join(TOOL_RESULT_DIR, f"{req_id}.json") if _safe_request_id(req_id) else None
+            if result_path and os.path.exists(result_path):
                 try:
                     with open(result_path) as f:
                         data = json.load(f)
@@ -483,4 +522,11 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 
-ThreadingHTTPServer((os.environ.get("JARVIS_QUEUE_BIND", "0.0.0.0"), int(os.environ.get("JARVIS_QUEUE_PORT", "9092"))), Queue).serve_forever()
+if __name__ == "__main__":
+    ThreadingHTTPServer(
+        (
+            os.environ.get("JARVIS_QUEUE_BIND", "0.0.0.0"),
+            int(os.environ.get("JARVIS_QUEUE_PORT", "9092")),
+        ),
+        Queue,
+    ).serve_forever()

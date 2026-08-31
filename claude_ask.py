@@ -81,6 +81,17 @@ POLL_TIMEOUT_S = 600  # agentic file-editing tasks can genuinely take a while
 # an oversight. Groups keep the static "🤔 Thinking" placeholder unchanged.
 THINKING_SPINNER_FRAMES = "⠋⠙⠚⠞⠖⠦⠴⠲⠳⠓"
 
+# Telegram-side effects and persistent trigger changes are never accepted
+# from an arbitrary queued request.  Read-only tools remain available to
+# callers, while this allowlist is checked again by the live userbot before
+# it touches Telegram.
+OWNER_ONLY_TOOLS = frozenset({
+    "create_group", "invite_to_group", "get_invite_link", "send_message",
+    "send_message_as_bot", "send_file", "add_contact", "remove_contact",
+    "block_user", "unblock_user", "leave_chat", "register_trigger",
+    "remove_trigger", "edit_trigger", "delete_messages", "forward_message",
+})
+
 # Voice/audio transcription -- Mistral's Voxtral API (cloud, owner's own key,
 # generous free tier per the owner directly). Confirmed against Mistral's own
 # docs 2026-08-05, not guessed: POST multipart/form-data, model
@@ -207,6 +218,7 @@ class ClaudeAsk(loader.Module):
 
     async def client_ready(self):
         self._topics = {}
+        self._owner_id_cache = None
         # chat_id -> asyncio.Lock, serializes action=agent/reply trigger
         # firings against the same --resume session (see
         # _agent_trigger_lock) so two messages landing close together in
@@ -227,6 +239,28 @@ class ClaudeAsk(loader.Module):
 
     def _agent_trigger_lock(self, chat_id):
         return self._agent_trigger_locks.setdefault(chat_id, asyncio.Lock())
+
+    async def _get_owner_id(self):
+        owner_id = getattr(self, "_owner_id_cache", None)
+        if owner_id is None:
+            try:
+                me = await self._client.get_me()
+            except Exception:
+                return None
+            owner_id = getattr(me, "id", None)
+            if owner_id is None:
+                return None
+            self._owner_id_cache = owner_id
+        return owner_id
+
+    async def _tool_request_is_owner(self, requester_id):
+        if requester_id is None or not str(requester_id).strip():
+            return False
+        try:
+            owner_id = await self._get_owner_id()
+            return owner_id is not None and str(requester_id) == str(owner_id)
+        except Exception:
+            return False
 
     def _mark_sent_message(self, chat_id, result):
         if chat_id and isinstance(result, str) and result.startswith("✅"):
@@ -868,7 +902,10 @@ class ClaudeAsk(loader.Module):
         ordered = ([anchor_msg] if anchor_msg else []) + list(reversed(new_msgs))
         return await self._format_messages(ordered), True
 
-    def _enqueue(self, question, chat_id, req_id, mode="chat", topic_id=None, exclude_id=None):
+    def _enqueue(
+        self, question, chat_id, req_id, mode="chat", topic_id=None,
+        exclude_id=None, requester_id=None,
+    ):
         try:
             payload = {
                 "question": question, "chat_id": str(chat_id),
@@ -885,6 +922,8 @@ class ClaudeAsk(loader.Module):
                 payload["topic_id"] = topic_id
             if exclude_id is not None:
                 payload["message_id"] = exclude_id
+            if requester_id is not None:
+                payload["requester_id"] = requester_id
             data = json.dumps(payload).encode()
             urllib.request.urlopen(
                 urllib.request.Request(
@@ -2231,7 +2270,10 @@ class ClaudeAsk(loader.Module):
         # against repeats of themselves.
         async with self._agent_trigger_lock(message.chat_id):
             req_id = str(uuid.uuid4())
-            if not self._enqueue(question, message.chat_id, req_id, "chat"):
+            if not self._enqueue(
+                question, message.chat_id, req_id, "chat",
+                requester_id=await self._get_owner_id(),
+            ):
                 fallback = self._fallback_backend() if allow_fallback else None
                 if fallback is not None:
                     return await fallback._fire_reply_via_agent(
@@ -2440,7 +2482,10 @@ class ClaudeAsk(loader.Module):
         async with self._agent_trigger_lock(message.chat_id):
             self._agent_turn_sent[str(message.chat_id)] = False
             req_id = str(uuid.uuid4())
-            if not self._enqueue(prompt, message.chat_id, req_id, "chat"):
+            if not self._enqueue(
+                prompt, message.chat_id, req_id, "chat",
+                requester_id=await self._get_owner_id(),
+            ):
                 fallback = self._fallback_backend() if allow_fallback else None
                 if fallback is not None:
                     return await fallback._fire_agent_action(
@@ -2962,8 +3007,11 @@ class ClaudeAsk(loader.Module):
         tool = data.get("tool")
         args = data.get("args") or {}
         chat_id = data.get("chat_id") or ""
+        requester_id = data.get("requester_id")
         try:
-            if tool == "resolve_person":
+            if tool in OWNER_ONLY_TOOLS and not await self._tool_request_is_owner(requester_id):
+                result = "⛔ Это действие доступно только владельцу юзербота."
+            elif tool == "resolve_person":
                 result = await self._resolve_person(args.get("query", ""))
             elif tool == "create_group":
                 result = await self._create_group_action(args.get("title", ""), args.get("members") or [])
@@ -3295,7 +3343,11 @@ class ClaudeAsk(loader.Module):
         topic_id = self._topic_of(message)
         enqueued = False
         async with self._client.action(chat_id, "typing"):
-            if self._enqueue(question, chat_id, req_id, mode, topic_id=topic_id, exclude_id=work_message.id):
+            if self._enqueue(
+                question, chat_id, req_id, mode, topic_id=topic_id,
+                exclude_id=work_message.id,
+                requester_id=getattr(message, "sender_id", None),
+            ):
                 enqueued = True
                 work_message, answer, thoughts = await self._poll_progress_and_result(
                     work_message, req_id, animate=animate,

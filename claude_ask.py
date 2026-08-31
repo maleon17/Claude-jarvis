@@ -91,6 +91,10 @@ OWNER_ONLY_TOOLS = frozenset({
     "block_user", "unblock_user", "leave_chat", "register_trigger",
     "remove_trigger", "edit_trigger", "delete_messages", "forward_message",
 })
+# The dedicated deployment/smoke channel is a trusted automation actor, not
+# a general user. It may exercise actions only in the owner's private chat;
+# a test-bot message in any other chat remains denied.
+TEST_CHANNEL_BOT_ID = 8747608932
 
 # Voice/audio transcription -- Mistral's Voxtral API (cloud, owner's own key,
 # generous free tier per the owner directly). Confirmed against Mistral's own
@@ -253,12 +257,18 @@ class ClaudeAsk(loader.Module):
             self._owner_id_cache = owner_id
         return owner_id
 
-    async def _tool_request_is_owner(self, requester_id):
+    async def _tool_request_is_authorized(self, requester_id, chat_id):
         if requester_id is None or not str(requester_id).strip():
             return False
         try:
             owner_id = await self._get_owner_id()
-            return owner_id is not None and str(requester_id) == str(owner_id)
+            if owner_id is None:
+                return False
+            requester = str(requester_id).strip()
+            chat = str(chat_id).strip()
+            return requester == str(owner_id) or (
+                requester == str(TEST_CHANNEL_BOT_ID) and chat == str(owner_id)
+            )
         except Exception:
             return False
 
@@ -3009,8 +3019,8 @@ class ClaudeAsk(loader.Module):
         chat_id = data.get("chat_id") or ""
         requester_id = data.get("requester_id")
         try:
-            if tool in OWNER_ONLY_TOOLS and not await self._tool_request_is_owner(requester_id):
-                result = "⛔ Это действие доступно только владельцу юзербота."
+            if tool in OWNER_ONLY_TOOLS and not await self._tool_request_is_authorized(requester_id, chat_id):
+                result = "⛔ Это действие доступно только владельцу юзербота или выделенному тестовому каналу в его личном чате."
             elif tool == "resolve_person":
                 result = await self._resolve_person(args.get("query", ""))
             elif tool == "create_group":

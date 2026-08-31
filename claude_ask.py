@@ -1526,6 +1526,52 @@ class ClaudeAsk(loader.Module):
         await self._notify_topic("moderation", f"🚪 Вышел из <b>{_h(title)}</b>")
         return f"✅ Вышел из «{title}»"
 
+    async def _list_chat_members_action(self, chat_arg, chat_id):
+        """Real list_chat_members MCP tool handler -- answers "who's in this
+        chat" with Telegram's own server-side participant list
+        (GetParticipants, via herokutl's iter_participants), i.e. REAL
+        membership. This is deliberately a separate tool from
+        search_chat/read_history: message history only ever shows people
+        who've actually posted something, silently missing every lurking
+        member -- exactly the gap the model correctly refused to paper
+        over live on 2026-08-31 rather than guess a fake "everyone" list
+        for a confirm_users allowlist.
+
+        Capped at `cap` entries so one result stays inside a single
+        tool_call_result payload/chat message -- a truncation note is
+        appended if the chat has more members than that.
+
+        Known limitation, not a bug here: some large supergroups restrict
+        the full member list to admins only (an actual Telegram-side
+        setting, independent of this account's own rights), and a chat
+        this account isn't really a member of won't resolve at all --
+        both surface as an empty/partial result with no special-cased
+        error, same fail-toward-empty behaviour _get_chat_admin_ids
+        already has for the admin-only lookup."""
+        target_chat_id = await self._resolve_any_chat_target(chat_arg, chat_id) if chat_arg else int(chat_id)
+        if target_chat_id is None:
+            return f"Не нашёл чат «{chat_arg}»."
+        cap = 300
+        lines, total = [], 0
+        try:
+            async for p in self._client.iter_participants(target_chat_id, limit=cap + 1):
+                total += 1
+                if len(lines) >= cap:
+                    continue
+                uname = f"@{p.username}" if getattr(p, "username", None) else ""
+                name = self._dialog_full_name(p) or ""
+                bits = [b for b in (uname, name) if b]
+                lines.append(f"- {' / '.join(bits) if bits else '(без имени)'} (id={p.id})")
+        except Exception as e:
+            return f"Не смог получить список участников: {e}"
+        if not lines:
+            return "Участников не нашёл (либо чат пуст для этого аккаунта, либо Telegram скрывает список для не-админов этого чата)."
+        chat_label = await self._chat_label(target_chat_id)
+        header = f"Участники «{chat_label}»"
+        if total > cap:
+            header += f" (показаны первые {cap} из {total}+)"
+        return header + ":\n" + "\n".join(lines)
+
     # -- Triggers (Phase 4) ---------------------------------------------------
 
     def _get_triggers(self):
@@ -1533,6 +1579,19 @@ class ClaudeAsk(loader.Module):
 
     def _set_triggers(self, triggers):
         self.db.set("ClaudeAsk", "triggers", triggers)
+
+    def _find_trigger_by_id(self, trig_id):
+        """Look up a trigger by id across every chat's list -- used by a
+        confirm card's button press to recover the ORIGINAL trigger (for
+        its confirm_users allowlist, see _confirm_authorized) from just the
+        id baked into the button's args. Returns None if the trigger was
+        since removed/edited-and-replaced -- callers must treat that as
+        "no per-trigger allowlist available", not crash."""
+        for trigs in self._get_triggers().values():
+            found = next((t for t in trigs if t["id"] == trig_id), None)
+            if found is not None:
+                return found
+        return None
 
     async def _resolve_any_chat_target(self, target, chat_id):
         """Like _resolve_group_target/_resolve_send_target but across ANY
@@ -1710,6 +1769,9 @@ class ClaudeAsk(loader.Module):
         only_senders = spec.get("only_senders")
         if isinstance(only_senders, (str, int)):
             only_senders = [only_senders]
+        confirm_users = spec.get("confirm_users")
+        if isinstance(confirm_users, (str, int)):
+            confirm_users = [confirm_users]
         trig = {
             "id": uuid.uuid4().hex[:8],
             "kind": kind,
@@ -1746,6 +1808,16 @@ class ClaudeAsk(loader.Module):
             # other participant would burn a full agentic call and pollute
             # the resumed session's context with irrelevant noise.
             "only_senders": [str(s) for s in (only_senders or [])],
+            # action=confirm only: extra people (id or @username) allowed to
+            # press THIS trigger's Удалить/Оставить buttons, on top of the
+            # owner (always) and -- if target routed the card externally --
+            # that chat's Telegram admins (see _confirm_authorized). Exists
+            # because the admin check depends on a live GetParticipants call
+            # succeeding for that exact chat, which silently fails closed
+            # (denies everyone but the owner) on any error -- a fixed
+            # allowlist here works even when Telegram's own admin list is
+            # unavailable, stale, or the person just isn't a real chat admin.
+            "confirm_users": [str(s) for s in (confirm_users or [])],
         }
         return trig, None
 
@@ -1910,6 +1982,8 @@ class ClaudeAsk(loader.Module):
                 exempt_bits.append("доверенные: " + ", ".join(t["trusted_senders"]))
             if t.get("skip_admins"):
                 exempt_bits.append("не трогает админов")
+            if t.get("confirm_users"):
+                exempt_bits.append("подтверждать могут: " + ", ".join(t["confirm_users"]))
             if t.get("target"):
                 exempt_bits.append("target: " + str(t["target"]))
             if exempt_bits:
@@ -2525,14 +2599,45 @@ class ClaudeAsk(loader.Module):
             f"Сообщение: <blockquote>{_h(text_preview_raw)}</blockquote>"
             f"{verify_note}{notify_note}{link_note}{target_note}\nУдалить?"
         )
+        # Heroku's OWN inline framework gates ANY button press to
+        # security._owner (real owner + .owneradd'd people) UNLESS the
+        # button dict itself carries "always_allow": [user_id, ...] --
+        # this check runs in heroku/inline/events.py BEFORE our own
+        # callback (_trigger_confirm_delete/_dismiss, hence _confirm_authorized)
+        # ever gets invoked, completely independent of it. Discovered live
+        # 2026-08-31: a non-owner confirm_users entry (real person, correct
+        # username) got Heroku's own native "Вы не можете нажать на эту
+        # кнопку" -- our confirm_users allowlist alone never had a chance
+        # to run. always_allow needs real numeric ids (Telegram's own
+        # security._owner list is ids, and the framework does a plain `in`
+        # membership check against it) -- resolve confirm_users' mix of
+        # ids/@usernames here, once per card, rather than storing ids only
+        # (usernames stay human-editable/readable in the trigger itself).
+        # This is the deliberately narrow alternative to .owneradd, which
+        # the owner does NOT want to hand out here (.owneradd is full
+        # co-owner control of the whole userbot, not just these buttons).
+        always_allow_ids = []
+        for u in (trig.get("confirm_users") or []):
+            raw = u.lstrip("@")
+            if raw.isdigit():
+                always_allow_ids.append(int(raw))
+                continue
+            try:
+                ent = await self._client.get_entity(raw)
+                if getattr(ent, "id", None):
+                    always_allow_ids.append(ent.id)
+            except Exception:
+                pass
         markup = self.inline.generate_markup([[
             {
                 "text": "🗑 Удалить", "callback": self._trigger_confirm_delete,
-                "args": (message.chat_id, message.id),
+                "args": (trig["id"], message.chat_id, message.id),
+                "always_allow": always_allow_ids,
             },
             {
                 "text": "✅ Оставить", "callback": self._trigger_confirm_dismiss,
-                "args": (message.chat_id, message.id),
+                "args": (trig["id"], message.chat_id, message.id),
+                "always_allow": always_allow_ids,
             },
         ]])
         thread_kwargs = {"message_thread_id": topic_id} if topic_id else {}
@@ -2564,54 +2669,98 @@ class ClaudeAsk(loader.Module):
 
     _owner_id_cache = None  # this account's own user id, resolved once
 
-    async def _confirm_authorized(self, call):
+    async def _confirm_authorized(self, call, trig):
         """Who's allowed to press a confirm card's Удалить/Оставить
-        buttons: the owner (this account) always, or -- if the card was
-        routed to an external chat via action=confirm's `target` (see
-        _send_confirm_request) -- an admin of THAT chat too, since it's
-        their own community being moderated. call.chat_id is wherever the
-        card actually landed, so this generalizes automatically: the
-        default (unrouted) case posts into the owner's own private forum,
-        where only the owner is a member anyway, same restriction as
-        before this existed. Reuses _get_chat_admin_ids -- the same cached
-        admin lookup skip_admins already relies on -- rather than a fresh
-        per-press API call. Fails CLOSED (denies) if the admin lookup
-        itself fails, same fail-safe direction as everywhere else in this
-        file that gates an action on trust."""
+        buttons: the owner (this account) always; anyone listed in the
+        ORIGINAL trigger's confirm_users (id or @username, see
+        _build_trigger) always, regardless of Telegram admin status; or --
+        if the card was routed to an external chat via action=confirm's
+        `target` (see _send_confirm_request) -- an admin of THAT chat too,
+        since it's their own community being moderated. call.chat_id is
+        wherever the card actually landed, so the admin branch generalizes
+        automatically: the default (unrouted) case posts into the owner's
+        own private forum, where only the owner is a member anyway, same
+        restriction as before this existed. `trig` may be None if the
+        trigger was removed/edited-and-replaced since the card was sent
+        (see _find_trigger_by_id) -- confirm_users is then simply
+        unavailable, owner/admin checks still apply. Reuses
+        _get_chat_admin_ids -- the same cached admin lookup skip_admins
+        already relies on -- rather than a fresh per-press API call. Fails
+        CLOSED (denies) if the admin lookup itself fails, same fail-safe
+        direction as everywhere else in this file that gates an action on
+        trust -- confirm_users exists precisely because that admin lookup
+        can fail closed for a real admin too (GetParticipants erroring for
+        any reason denies EVERYONE but the owner, with nothing logged) --
+        a fixed per-trigger allowlist sidesteps that dependency entirely.
+
+        BUG WORKAROUND (found live 2026-08-31): a confirm card is sent via
+        self.inline.bot.send_message (see _send_confirm_request), so the
+        callback arrives wrapped as heroku/inline/types.py's BotInlineCall.
+        Its __init__ first runs _CallbackMixin._init_callback, which sets
+        self.sender_id = call.sender_id correctly -- but then immediately
+        calls BotInlineMessage.__init__ WITHOUT a `message=` kwarg, and
+        THAT unconditionally does `self.sender_id = getattr(message, ...,
+        None)`, silently overwriting the correct value with None for every
+        single press regardless of who's pressing. Confirmed live via a
+        temporary debug alert (owner and confirm_users members got the
+        exact same denial, root cause traced by literally reading heroku's
+        own source -- this isn't a guess). The RAW, never-clobbered value
+        survives on call.original_call (set by _init_callback, untouched
+        by BotInlineMessage.__init__) -- use that instead of call.sender_id
+        anywhere on this specific call type."""
+        real_sender_id = call.original_call.sender_id
         if self._owner_id_cache is None:
             me = await self._client.get_me()
             self._owner_id_cache = me.id
-        if call.sender_id == self._owner_id_cache:
+        if real_sender_id == self._owner_id_cache:
             return True
+        if trig and trig.get("confirm_users"):
+            if str(real_sender_id) in trig["confirm_users"]:
+                return True
+            uname = None
+            try:
+                ent = await self._client.get_entity(real_sender_id)
+                uname = getattr(ent, "username", None)
+            except Exception:
+                pass
+            if uname and any(u.lstrip("@").lower() == uname.lower() for u in trig["confirm_users"]):
+                return True
         admin_ids = await self._get_chat_admin_ids(call.chat_id)
-        return call.sender_id in admin_ids
+        return real_sender_id in admin_ids
 
-    async def _trigger_confirm_delete(self, call, target_chat_id, target_message_id):
+    async def _trigger_confirm_delete(self, call, trig_id, target_chat_id, target_message_id):
         # call.edit() -> InlineManager._edit_unit(), which has no `parse_mode`
         # param at all (no **kwargs sink either -- an unknown kwarg is a hard
         # TypeError, not silently ignored). Text is already treated as HTML
         # implicitly there (sanitise_text just strips <emoji> tags, no mode
         # toggle exists), so passing parse_mode was never doing anything
         # except crashing this callback on every press.
-        if not await self._confirm_authorized(call):
+        trig = self._find_trigger_by_id(trig_id)
+        if not await self._confirm_authorized(call, trig):
             await call.answer(
-                "Только владелец или админы этой группы могут это подтверждать.", show_alert=True,
+                "Только владелец, доверенные пользователи или админы этой группы могут это подтверждать.",
+                show_alert=True,
             )
             return
         try:
-            actor = await self._sender_label(call)
+            # call.sender_id is unreliable here (see _confirm_authorized's
+            # docstring) -- pass the raw original_call, whose sender_id was
+            # never clobbered.
+            actor = await self._sender_label(call.original_call)
             await self._client.delete_messages(target_chat_id, target_message_id)
             await call.edit(f"🗑 Удалено пользователем {_h(actor)}.")
         except Exception as e:
             await call.edit(f"⚠️ Не смог удалить: {_h(str(e))}")
 
-    async def _trigger_confirm_dismiss(self, call, target_chat_id, target_message_id):
-        if not await self._confirm_authorized(call):
+    async def _trigger_confirm_dismiss(self, call, trig_id, target_chat_id, target_message_id):
+        trig = self._find_trigger_by_id(trig_id)
+        if not await self._confirm_authorized(call, trig):
             await call.answer(
-                "Только владелец или админы этой группы могут это подтверждать.", show_alert=True,
+                "Только владелец, доверенные пользователи или админы этой группы могут это подтверждать.",
+                show_alert=True,
             )
             return
-        actor = await self._sender_label(call)
+        actor = await self._sender_label(call.original_call)
         await call.edit(f"✅ Оставлено пользователем {_h(actor)}.")
 
     async def _fire_triggers(self, matched, message):
@@ -2836,6 +2985,8 @@ class ClaudeAsk(loader.Module):
                 result = await self._contact_action(tool, args.get("target", ""))
             elif tool == "leave_chat":
                 result = await self._leave_chat_action(args.get("target", ""), chat_id)
+            elif tool == "list_chat_members":
+                result = await self._list_chat_members_action(args.get("chat", ""), chat_id)
             elif tool == "register_trigger":
                 result = await self._register_trigger_action(
                     args.get("chat", ""), args.get("specs") or [], chat_id, args.get("anchor_msg_id"),

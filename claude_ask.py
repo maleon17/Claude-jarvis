@@ -95,6 +95,14 @@ OWNER_ONLY_TOOLS = frozenset({
 # a general user. It may exercise actions only in the owner's private chat;
 # a test-bot message in any other chat remains denied.
 TEST_CHANNEL_BOT_ID = 8747608932
+INTERNAL_TOOL_RESULT_PREFIX = "[INTERNAL_TOOL_RESULT]"
+TOOL_PERMISSION_DENIAL = (
+    f"{INTERNAL_TOOL_RESULT_PREFIX} Действие заблокировано: Telegram-действия "
+    "доступны только владельцу юзербота или выделенному тестовому каналу в "
+    "личном чате владельца. Действие НЕ выполнено. Не цитируй "
+    "эту служебную строку пользователю и не подменяй ею финальный ответ; "
+    "не ищи обход и не утверждай, что действие выполнено."
+)
 
 # Voice/audio transcription -- Mistral's Voxtral API (cloud, owner's own key,
 # generous free tier per the owner directly). Confirmed against Mistral's own
@@ -3020,7 +3028,7 @@ class ClaudeAsk(loader.Module):
         requester_id = data.get("requester_id")
         try:
             if tool in OWNER_ONLY_TOOLS and not await self._tool_request_is_authorized(requester_id, chat_id):
-                result = "⛔ Это действие доступно только владельцу юзербота или выделенному тестовому каналу в его личном чате."
+                result = TOOL_PERMISSION_DENIAL
             elif tool == "resolve_person":
                 result = await self._resolve_person(args.get("query", ""))
             elif tool == "create_group":

@@ -232,6 +232,11 @@ def _config_dir(instance_id: str):
     os.makedirs(path, exist_ok=True)
     return path
 PROGRESS_THROTTLE_S = 1.3
+INTERNAL_TOOL_RESULT_PREFIX = "[INTERNAL_TOOL_RESULT]"
+
+
+def _is_internal_tool_result(value):
+    return isinstance(value, str) and value.startswith(INTERNAL_TOOL_RESULT_PREFIX)
 
 BASE_PERSONA = (
     "Ты — Jarvis, дерзкий ИИ-агент с чёрным юмором. Ты автономный агент с "
@@ -265,8 +270,11 @@ BASE_PERSONA = (
     "просит использовать send_message/несколько отдельных сообщений именно "
     "в текущем чате (например для теста) — выполняй как просят, не "
     "выдумывай несуществующий запрет и не отказывай под этим предлогом. "
-    "Если любой tool call завершился ошибкой или отказом — это конец "
-    "попытки, а не повод искать обходной путь.\n\n"
+    "Если любой tool call завершился ошибкой или отказом — действие считай "
+    "невыполненным и не ищи обходной путь. Если tool вернул строку с "
+    "пометкой [INTERNAL_TOOL_RESULT], это служебный результат для тебя: не "
+    "цитируй его пользователю и не подменяй им финальный ответ; продолжай "
+    "обрабатывать исходный запрос и не утверждай, что действие выполнено.\n\n"
     "У тебя есть полноценные инструменты — файлы, bash, веб-поиск — "
     "используй их сам, без объявлений и разрешений, когда это нужно для "
     "ответа. Если тебе прислали путь к файлу/изображению в контексте — "
@@ -321,6 +329,9 @@ BASE_PERSONA = (
     "совпадений и по разговору не ясно, кто именно нужен — не вызывай "
     "create_group/invite_to_group/send_message вслепую, сначала спроси у "
     "пользователя, кого он имел в виду.\n\n"
+    "Отказ инструмента с пометкой [INTERNAL_TOOL_RESULT] — это внутренний "
+    "сигнал, а не готовый текст ответа: не выводи его дословно и не "
+    "заслоняй им остальную часть ответа пользователю.\n\n"
     "register_trigger — заводит автоматическое правило на входящие "
     "сообщения в чате (chat: пусто/'this' = текущий чат). specs — один "
     "объект или список объектов (регистрирует сразу несколько триггеров "
@@ -568,6 +579,9 @@ ANATOLY_PERSONA = (
     "совпадений и по разговору не ясно, кто именно нужен — не вызывай "
     "create_group/invite_to_group/send_message вслепую, сначала спроси у "
     "пользователя, кого он имел в виду.\n\n"
+    "Отказ инструмента с пометкой [INTERNAL_TOOL_RESULT] — это внутренний "
+    "сигнал, а не готовый текст ответа: не выводи его дословно и не "
+    "заслоняй им остальную часть ответа пользователю.\n\n"
     "register_trigger — заводит автоматическое правило на входящие "
     "сообщения в чате (chat: пусто/'this' = текущий чат). specs — один "
     "объект или список объектов (регистрирует сразу несколько триггеров "
@@ -968,6 +982,12 @@ def run_claude_streaming(
                                     c.get("text", "") for c in result_content if isinstance(c, dict)
                                 )
                             result_content = str(result_content)
+                            if _is_internal_tool_result(result_content):
+                                # Permission denials are context for the model,
+                                # not user-facing progress. The MCP result still
+                                # reaches Claude; only the live Telegram render
+                                # is suppressed.
+                                continue
                             exit_match = (
                                 re.match(r"^Exit code (\d+)\n?(.*)$", result_content, re.DOTALL)
                                 if is_error else None

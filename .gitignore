@@ -11,3 +11,8 @@ uploads_*/
 *.log
 *.processing
 *.service
+
+# Anatoly's own instance -- real, in local use, but a separate person's
+# config has no business in a public repo (2026-08-31, per the owner
+# directly). History scrubbed with git-filter-repo the same day.
+claude_ask_anatoly.py

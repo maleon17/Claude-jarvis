@@ -82,14 +82,17 @@ POLL_TIMEOUT_S = 600  # agentic file-editing tasks can genuinely take a while
 THINKING_SPINNER_FRAMES = "⠋⠙⠚⠞⠖⠦⠴⠲⠳⠓"
 
 # Telegram-side effects and persistent trigger changes are never accepted
-# from an arbitrary queued request.  Read-only tools remain available to
-# callers, while this allowlist is checked again by the live userbot before
-# it touches Telegram.
-OWNER_ONLY_TOOLS = frozenset({
-    "create_group", "invite_to_group", "get_invite_link", "send_message",
-    "send_message_as_bot", "send_file", "add_contact", "remove_contact",
-    "block_user", "unblock_user", "leave_chat", "register_trigger",
-    "remove_trigger", "edit_trigger", "delete_messages", "forward_message",
+# from an arbitrary queued request. Default-deny: only tools explicitly
+# listed in PUBLIC_TOOLS run without authorization -- every other tool,
+# including any added here later and never revisited, requires
+# _tool_request_is_authorized to pass. This replaces a previous
+# OWNER_ONLY_TOOLS denylist, which silently let a brand new tool run
+# unauthenticated by default unless someone remembered to add it to the
+# dangerous-tools set; forgetting to update this allowlist instead only
+# ever means MORE gating, never less.
+PUBLIC_TOOLS = frozenset({
+    "resolve_person", "list_chat_members", "list_triggers",
+    "search_chat", "read_history",
 })
 # The dedicated deployment/smoke channel is a trusted automation actor, not
 # a general user. It may exercise actions only in the owner's private chat;
@@ -3027,7 +3030,7 @@ class ClaudeAsk(loader.Module):
         chat_id = data.get("chat_id") or ""
         requester_id = data.get("requester_id")
         try:
-            if tool in OWNER_ONLY_TOOLS and not await self._tool_request_is_authorized(requester_id, chat_id):
+            if tool not in PUBLIC_TOOLS and not await self._tool_request_is_authorized(requester_id, chat_id):
                 result = TOOL_PERMISSION_DENIAL
             elif tool == "resolve_person":
                 result = await self._resolve_person(args.get("query", ""))

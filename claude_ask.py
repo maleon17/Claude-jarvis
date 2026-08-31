@@ -1195,6 +1195,24 @@ class ClaudeAsk(loader.Module):
             return int(f"-100{entity.id}")
         return entity.id
 
+    def _message_link(self, message):
+        """Telegram deep link for channels/supergroups only."""
+        chat_id = str(getattr(message, "chat_id", "") or "")
+        if not chat_id.startswith("-100") or not getattr(message, "id", None):
+            return None
+        return f"https://t.me/c/{chat_id[4:]}/{message.id}"
+
+    async def _target_report_note(self, target):
+        if not target:
+            return ""
+        entity, topic_id = await self._resolve_target_entity_topic(target)
+        if entity is None:
+            return f"\nОтчёт отправлен в: «{_h(target)}»"
+        name = getattr(entity, "title", None) or self._dialog_full_name(entity) or str(entity.id)
+        if topic_id:
+            name = f"{name}, топик {topic_id}"
+        return f"\nОтчёт отправлен в: «{_h(name)}»"
+
     async def _resolve_target_entity_topic(self, target):
         """Parses "chat_id" / "chat_id/topic_id" addressing (matching the
         t.me/c/<id>/<topic> convention -- e.g. "3399019582/1" means topic 1
@@ -1527,6 +1545,26 @@ class ClaudeAsk(loader.Module):
         is_numeric = target.lstrip("-").isdigit()
         is_username = target.startswith("@")
         needle = (target[1:] if is_username else target).lower()
+        if is_numeric:
+            # Bot-API-style ids ("-100xxxx" for channels/supergroups, bare
+            # for users/basic groups) don't match Telethon's own raw
+            # entity.id for a channel -- .id there is the BARE id, with no
+            # -100 prefix, so the old `ent.id == int(target)` dialog-scan
+            # below could never match a group/channel passed by its real
+            # chat_id (bug found live 2026-08-30: the model tried to target
+            # THE CURRENT CHAT by the exact id it had in context and got
+            # "не нашёл чат", even though the account is obviously a member
+            # of it). Resolve through get_entity (which accepts either id
+            # form) instead, same pattern _resolve_send_target/
+            # _resolve_group_target/_resolve_leave_target already use.
+            try:
+                return self._bot_chat_id(await self._client.get_entity(int(target)))
+            except Exception:
+                pass
+            try:
+                return self._bot_chat_id(await self._client.get_entity(int(f"-100{target.lstrip('-')}")))
+            except Exception:
+                pass
         # Prefer a title already associated with stored triggers. Telegram
         # may contain multiple dialogs with the same display title; picking
         # the first generic dialog can otherwise select an unrelated chat
@@ -1541,15 +1579,13 @@ class ClaudeAsk(loader.Module):
         try:
             async for d in self._client.iter_dialogs():
                 ent = d.entity
-                if is_numeric and ent.id == int(target):
-                    return ent.id
                 username = (getattr(ent, "username", "") or "").lower()
                 name = (self._dialog_full_name(ent) if d.is_user else (getattr(ent, "title", "") or "")).lower()
                 if is_username:
                     if username == needle:
-                        return ent.id
+                        return self._bot_chat_id(ent)
                 elif not is_numeric and (needle == name or (username and needle == username)):
-                    return ent.id
+                    return self._bot_chat_id(ent)
         except Exception:
             pass
         return None
@@ -1740,8 +1776,8 @@ class ClaudeAsk(loader.Module):
             if err:
                 errors.append(err)
                 continue
-            trig["origin_chat_id"] = str(chat_id) if chat_id else None
-            trig["origin_msg_id"] = anchor_msg_id
+            trig["registration_chat_id"] = str(chat_id) if chat_id else None
+            trig["registration_msg_id"] = anchor_msg_id
             triggers.setdefault(str(chat_target), []).append(trig)
             created.append(trig)
 
@@ -1750,9 +1786,17 @@ class ClaudeAsk(loader.Module):
 
         self._set_triggers(triggers)
         chat_label = await self._chat_label(chat_target)
-        lines = [f"➕ [{t['id']}] {t['label']} → {t['action']}" for t in created]
+        lines = []
+        for t in created:
+            value_note = ""
+            if t.get("kind") in ("keyword", "link") and t.get("value"):
+                values = t["value"] if isinstance(t["value"], list) else [t["value"]]
+                value_note = " (слова: " + ", ".join(map(str, values)) + ")"
+            lines.append(f"➕ [{t['id']}] {t['label']}{value_note} → {t['action']}")
         await self._notify_topic(
-            "moderation", f"Новые триггеры в «{_h(chat_label)}»:\n" + "\n".join(_h(l) for l in lines),
+            "moderation",
+            f"➕ Созданы триггеры\nЧат: «{_h(chat_label)}»\nТриггеры:\n"
+            + "\n".join(_h(l) for l in lines),
         )
         err_note = f"\n⚠️ Пропущено: {'; '.join(errors)}" if errors else ""
         return f"✅ Зарегистрировано в «{chat_label}»:\n" + "\n".join(lines) + err_note
@@ -1763,7 +1807,7 @@ class ClaudeAsk(loader.Module):
         remove_trigger+register_trigger churn -- that round trip loses the
         original id (any in-flight reference to it, e.g. the owner just
         asking "поменяй условие у триггера X", goes stale) and
-        origin_chat_id/origin_msg_id (action=agent's _reply_to_origin
+        registration_chat_id/registration_msg_id (action=agent's _reply_to_origin
         anchor), and leaves a real window where the trigger doesn't exist
         at all between the two calls.
 
@@ -1776,7 +1820,7 @@ class ClaudeAsk(loader.Module):
         action=post needs target, value/trusted_senders/only_senders
         shape) so create and edit can't drift out of sync on the rules --
         then discards _build_trigger's freshly minted id and overwrites it
-        back with the original id/origin_chat_id/origin_msg_id, since this
+        back with the original id/registration_chat_id/registration_msg_id, since this
         is a patch, not a new trigger.
 
         Caveat: `label` is NOT auto-regenerated from a changed `value` --
@@ -1796,15 +1840,30 @@ class ClaudeAsk(loader.Module):
                 if err:
                     return f"Не смог применить правку: {err}"
                 new_trig["id"] = t["id"]
-                new_trig["origin_chat_id"] = t.get("origin_chat_id")
-                new_trig["origin_msg_id"] = t.get("origin_msg_id")
+                new_trig["registration_chat_id"] = t.get("registration_chat_id")
+                new_trig["registration_msg_id"] = t.get("registration_msg_id")
                 trigs[i] = new_trig
                 self._set_triggers(triggers)
                 chat_label = await self._chat_label(int(cid))
-                changed = ", ".join(f"{k}={updates[k]!r}" for k in updates)
+                def display(value, limit=180):
+                    if isinstance(value, list):
+                        value = ", ".join(map(str, value))
+                    elif value is None:
+                        value = "—"
+                    else:
+                        value = str(value)
+                    return value if len(value) <= limit else value[:limit - 1] + "…"
+                changed_lines = []
+                for key in updates:
+                    prefix = "слова" if key == "value" else key
+                    limit = 180 if key in ("verify", "instruction", "template") else 300
+                    changed_lines.append(
+                        f"{_h(prefix)}: {_h(display(t.get(key), limit))} → {_h(display(new_trig.get(key), limit))}"
+                    )
                 await self._notify_topic(
                     "moderation",
-                    f"✏️ Изменён триггер [{_h(trig_id)}] в «{_h(chat_label)}»: {_h(changed)}",
+                    f"✏️ Изменён триггер [{_h(trig_id)}]\n"
+                    f"Чат: «{_h(chat_label)}»\n" + "\n".join(changed_lines),
                 )
                 return f"✅ Триггер {trig_id} изменён ({', '.join(updates.keys())})."
         return f"Триггер {trig_id} не найден."
@@ -1841,6 +1900,9 @@ class ClaudeAsk(loader.Module):
             except (ValueError, TypeError):
                 chat_label = f"НЕИЗВЕСТНЫЙ ЧАТ (битый ключ {cid!r})"
             line = f"- id={t['id']}, [{t.get('engine', 'claude')}] чат «{chat_label}», {t['kind']} → {t['action']}: {t.get('label', '')}"
+            if t.get("kind") in ("keyword", "link") and t.get("value"):
+                values = t["value"] if isinstance(t["value"], list) else [t["value"]]
+                line += "\n  слова: " + ", ".join(map(str, values))
             exempt_bits = []
             if t.get("only_senders"):
                 exempt_bits.append("только от: " + ", ".join(t["only_senders"]))
@@ -1859,26 +1921,52 @@ class ClaudeAsk(loader.Module):
         """Real remove_trigger MCP tool handler (was the REMOVE_TRIGGER
         text marker)."""
         triggers = self._get_triggers()
-        removed = False
+        removed = None
         for cid in list(triggers.keys()):
-            before = len(triggers[cid])
+            found = next((t for t in triggers[cid] if t["id"] == trig_id), None)
+            if found is not None:
+                removed = (cid, found.copy())
             triggers[cid] = [t for t in triggers[cid] if t["id"] != trig_id]
-            if len(triggers[cid]) != before:
-                removed = True
             if not triggers[cid]:
                 del triggers[cid]
         if not removed:
             return f"Триггер {trig_id} не найден."
         self._set_triggers(triggers)
-        await self._notify_topic("moderation", f"➖ Удалён триггер [{_h(trig_id)}]")
+        cid, trig = removed
+        chat_label = await self._chat_label(int(cid))
+        await self._notify_topic(
+            "moderation",
+            f"➖ Удалён триггер [{_h(trig_id)}]\n"
+            f"Чат: «{_h(chat_label)}»\n"
+            f"Метка: {_h(trig.get('label') or '—')}\n"
+            f"Тип: {_h(trig.get('kind') or '—')} → {_h(trig.get('action') or '—')}",
+        )
         return f"✅ Триггер {trig_id} удалён."
 
     async def _delete_messages_action(self, ids, chat_id):
         """Real delete_messages MCP tool handler (was the DELETE_MESSAGES
         text marker). `ids` arrives as a real list[int] now, not a comma/
-        space-separated string to parse."""
-        ids = [int(i) for i in ids]
+        space-separated string to parse -- but it's still model-supplied,
+        and a plain `int(i)` on every entry with no guard used to raise an
+        uncaught ValueError straight out of this function on a single bad
+        entry (e.g. a stray empty string from a hand-typed JSON array for
+        a long delete batch), surfacing to the user as a raw Python
+        exception string instead of an actionable message (caught live
+        2026-08-30: "снеси всю рекламу" -> "invalid literal for int() with
+        base 10: ''", the whole batch silently dropped with zero deleted).
+        Now skips unparseable entries and still deletes everything valid,
+        reporting what got skipped instead of failing the entire batch."""
+        clean_ids = []
+        bad = []
+        for i in ids:
+            try:
+                clean_ids.append(int(i))
+            except (TypeError, ValueError):
+                bad.append(repr(i))
+        ids = clean_ids
         if not ids:
+            if bad:
+                return f"Ни один id не распознан (мусор: {', '.join(bad)}). Ничего не удалено."
             return "Не указано ни одного id для удаления."
         try:
             await self._client.delete_messages(int(chat_id), ids)
@@ -1889,7 +1977,8 @@ class ClaudeAsk(loader.Module):
             "moderation",
             f"🗑 Удалено {len(ids)} сообщений (по запросу) в «{_h(chat_label)}»: {_h(', '.join(map(str, ids)))}",
         )
-        return f"✅ Удалено сообщений: {len(ids)}."
+        note = f" (пропущено {len(bad)} нераспознанных id: {', '.join(bad)})" if bad else ""
+        return f"✅ Удалено сообщений: {len(ids)}.{note}"
 
     async def _classify_condition(self, condition, text, allow_fallback=True):
         """Tier 1: 3-way ("yes"/"no"/"unsure") classification via
@@ -1965,6 +2054,7 @@ class ClaudeAsk(loader.Module):
         if urls:
             text += "\n\n[Реальные адреса ссылок в сообщении: " + ", ".join(urls) + "]"
         verdict = await self._classify_condition(trig.get("verify") or "", text)
+        trig["_verify_result"] = verdict
         if verdict == "yes":
             return trig.get("action", "delete")
         if verdict == "no":
@@ -2100,7 +2190,9 @@ class ClaudeAsk(loader.Module):
         await self._notify_topic(
             "moderation",
             f"↩️ Автоответ (агент, {_h(trig.get('label', 'reply'))}) — <b>{_h(chat_label)}</b>, "
-            f"{_h(sender)}:\n<blockquote>{_h(answer)}</blockquote>",
+            f"{_h(sender)}. Ответ отправлен."
+            + (f" Notify: {_h(trig['_notify_labels'])}." if trig.get("_notify_labels") else "")
+            + (f"\n🔗 {self._message_link(message)}" if self._message_link(message) else ""),
         )
 
     async def _poll_result_silent(self, req_id, timeout_s=POLL_TIMEOUT_S):
@@ -2132,6 +2224,7 @@ class ClaudeAsk(loader.Module):
         the send itself fails, same "never silently drop the audit trail"
         rule as _fire_post_action's own failure handling."""
         if target:
+            notice += await self._target_report_note(target)
             result = await self._send_message_action(target, notice, as_bot=True)
             if result.startswith("✅"):
                 return
@@ -2141,6 +2234,20 @@ class ClaudeAsk(loader.Module):
             )
         else:
             await self._notify_topic("moderation", notice)
+
+    async def _notify_trigger_report(self, target, trig_id, notice):
+        """Route a notify-only report, with a safe moderation fallback."""
+        if target:
+            notice += await self._target_report_note(target)
+            result = await self._send_message_action(target, notice, as_bot=True)
+            if result.startswith("✅"):
+                return
+            await self._notify_topic(
+                "moderation",
+                f"⚠️ Триггер [{_h(trig_id)}] не смог отправить notify-отчёт в target: {_h(result)}\n{notice}",
+            )
+            return
+        await self._notify_topic("notify", notice)
 
     async def _fire_post_action(self, trig, message, chat_label, sender, text_preview_raw, urls):
         """action='post': deterministic alternative to action=agent for the
@@ -2177,7 +2284,7 @@ class ClaudeAsk(loader.Module):
         as_bot = trig.get("as_bot", True)
         esc = (lambda s: s) if as_bot else _h
         template = trig.get("template") or (
-            "🔔 {label} - {chat}, {sender}:\n{text}"
+            "📨 {label} - {chat}, {sender}:\n{text}"
         )
         try:
             text = template.format(
@@ -2187,6 +2294,8 @@ class ClaudeAsk(loader.Module):
                 text=esc(text_preview_raw),
                 urls=esc(", ".join(urls)) if urls else "(нет)",
             )
+            if trig.get("_notify_labels"):
+                text += f"\n🔔 Также notify: {esc(trig['_notify_labels'])}"
         except (KeyError, IndexError, ValueError) as e:
             await self._notify_topic(
                 "moderation",
@@ -2276,7 +2385,11 @@ class ClaudeAsk(loader.Module):
                 )
                 return
             reporter = _HeadlessReporter(
-                lambda text: self._reply_to_origin(trig, f"🤖 (авто, {_h(trig.get('label') or 'agent')}): {text}")
+            lambda text: self._reply_to_origin(
+                trig,
+                f"🤖 (авто, {_h(trig.get('label') or 'agent')}): {text}"
+                + (f"\n🔔 Также notify: {_h(trig['_notify_labels'])}" if trig.get("_notify_labels") else ""),
+            )
             )
             await self._dispatch_answer(message, message.chat_id, prompt, "chat", 0, reporter, answer, thoughts)
             if not self._agent_turn_sent.get(str(message.chat_id)):
@@ -2299,7 +2412,7 @@ class ClaudeAsk(loader.Module):
 
     async def _reply_to_origin(self, trig, text):
         """Report an action=agent trigger's follow-up back into the exact
-        chat + message the task started from (origin_chat_id/origin_msg_id,
+        chat + message the trigger was registered from (registration_chat_id/registration_msg_id,
         captured once at register_trigger time -- see
         _register_trigger_action), instead of the shared cross-chat
         'notify' topic every other trigger action reports into. Keeps an
@@ -2311,7 +2424,7 @@ class ClaudeAsk(loader.Module):
         Sent via self._client (the owner's OWN account), NOT self.inline.bot
         -- deliberately different from _notify_topic's fixed moderation/
         notify/confirm/trash topics, which live in ONE specific forum
-        self.inline.bot was explicitly added to as a member. origin_chat_id
+        self.inline.bot was explicitly added to as a member. registration_chat_id
         can be ANY chat .ask was ever called from, and self.inline.bot has
         no general right to post into arbitrary chats it was never invited
         to (confirmed live: TOPIC_CLOSED / "Could not find the input
@@ -2328,13 +2441,13 @@ class ClaudeAsk(loader.Module):
         triggers registered before this field existed, or if the direct
         send fails for any reason (e.g. the origin message got deleted, or
         the owner has since left that chat)."""
-        origin_chat_id = trig.get("origin_chat_id")
-        if origin_chat_id:
+        registration_chat_id = trig.get("registration_chat_id")
+        if registration_chat_id:
             try:
                 kwargs = {}
-                if trig.get("origin_msg_id"):
-                    kwargs["reply_to"] = trig["origin_msg_id"]
-                await self._client.send_message(int(origin_chat_id), text, parse_mode="html", **kwargs)
+                if trig.get("registration_msg_id"):
+                    kwargs["reply_to"] = trig["registration_msg_id"]
+                await self._client.send_message(int(registration_chat_id), text, parse_mode="html", **kwargs)
                 return
             except Exception:
                 pass
@@ -2394,9 +2507,23 @@ class ClaudeAsk(loader.Module):
                 return
             target_chat = int(f"-100{channel_id}")
         label = trig.get("label") or trig.get("kind")
+        notify_note = f"\nТакже notify: {_h(trig['_notify_labels'])}" if trig.get("_notify_labels") else ""
+        engine = trig.get("engine", "claude")
+        link = self._message_link(message)
+        target_note = await self._target_report_note(custom_target)
+        verify = trig.get("verify")
+        verify_note = ""
+        if verify:
+            verify_note = (
+                f"\nУсловие проверки: {_h(verify)}"
+                f"\nРезультат классификации: {_h(trig.get('_verify_result') or 'unsure')}"
+            )
+        link_note = f'\n🔗 <a href="{_h(link)}">Исходное сообщение</a>' if link else ""
         text = (
-            f"❓ Подозрительное сообщение ({_h(label)}) — <b>{_h(chat_label)}</b>, {_h(sender)}:\n"
-            f"<blockquote>{_h(text_preview_raw)}</blockquote>\nУдалить?"
+            f"❓ [{_h(engine)}] Подозрительное сообщение ({_h(label)})\n"
+            f"Чат: «{_h(chat_label)}»\nОтправитель: {_h(sender)}\n"
+            f"Сообщение: <blockquote>{_h(text_preview_raw)}</blockquote>"
+            f"{verify_note}{notify_note}{link_note}{target_note}\nУдалить?"
         )
         markup = self.inline.generate_markup([[
             {
@@ -2472,8 +2599,9 @@ class ClaudeAsk(loader.Module):
             )
             return
         try:
+            actor = await self._sender_label(call)
             await self._client.delete_messages(target_chat_id, target_message_id)
-            await call.edit("🗑 Удалено.")
+            await call.edit(f"🗑 Удалено пользователем {_h(actor)}.")
         except Exception as e:
             await call.edit(f"⚠️ Не смог удалить: {_h(str(e))}")
 
@@ -2483,7 +2611,8 @@ class ClaudeAsk(loader.Module):
                 "Только владелец или админы этой группы могут это подтверждать.", show_alert=True,
             )
             return
-        await call.edit("✅ Оставлено, ложное срабатывание.")
+        actor = await self._sender_label(call)
+        await call.edit(f"✅ Оставлено пользователем {_h(actor)}.")
 
     async def _fire_triggers(self, matched, message):
         # .raw_text, NOT .text -- see _get_reply_text for why: herokutl's
@@ -2492,7 +2621,7 @@ class ClaudeAsk(loader.Module):
         # as escaped garbage ("&lt;b&gt;...") once quoted here. This is the
         # exact bug reported live 2026-08-11 ("цитата с текстом в виде
         # HTML" in the moderation topic).
-        text_preview_raw = (message.raw_text or "")[:500] or "(без текста)"
+        text_preview_raw = (message.raw_text or "")[:300] or "(без текста)"
         # Real link destinations, appended to what a human/agent actually
         # sees -- same reasoning as _resolve_verified_action/
         # _fire_agent_action's url_note (see _extract_urls' docstring): a
@@ -2515,14 +2644,21 @@ class ClaudeAsk(loader.Module):
         confirm_trigs = [t for t in matched if t["action"] == "confirm"]
         agent_trigs = [t for t in matched if t["action"] == "agent"]
         post_trigs = [t for t in matched if t["action"] == "post"]
-
-        if notify_trigs:
-            labels = ", ".join(t.get("label") or t["kind"] for t in notify_trigs)
-            await self._notify_topic(
-                "notify",
-                f"🔔 Триггер ({_h(labels)}) — <b>{_h(chat_label)}</b>, {_h(sender)}:\n"
-                f"<blockquote>{text_preview}</blockquote>",
+        link = self._message_link(message)
+        link_note = f"\n🔗 {link}" if link else ""
+        notify_labels = ", ".join(t.get("label") or t["kind"] for t in notify_trigs)
+        terminal = delete_trigs or confirm_trigs or post_trigs or agent_trigs or reply_trigs
+        if notify_trigs and not terminal:
+            target = next((t.get("target") for t in notify_trigs if t.get("target")), None)
+            notice = (
+                f"🔔 Триггер ({_h(notify_labels)}) — <b>{_h(chat_label)}</b>, {_h(sender)}:\n"
+                f"<blockquote>{text_preview}</blockquote>{link_note}"
             )
+            await self._notify_trigger_report(target, notify_trigs[0].get("id", "?"), notice)
+            return
+        if notify_labels:
+            for trig in terminal:
+                trig["_notify_labels"] = notify_labels
 
         # delete (confident) beats confirm (unsure) beats post beats agent
         # beats reply beats plain notify: no point asking a human to
@@ -2531,24 +2667,32 @@ class ClaudeAsk(loader.Module):
         # a delete decision) is pointless either way.
         if delete_trigs:
             labels = ", ".join(t.get("label") or t["kind"] for t in delete_trigs)
+            engines = ", ".join(dict.fromkeys(t.get("engine", "claude") for t in delete_trigs))
             skipped_all = reply_trigs + confirm_trigs + post_trigs + agent_trigs
             skip_note = ""
             if skipped_all:
                 skipped = ", ".join(t.get("label") or t["kind"] for t in skipped_all)
                 skip_note = f" (остальное отменено из-за удаления: {_h(skipped)})"
+            notify_note = f"; notify: {_h(notify_labels)}" if notify_labels else ""
             target = next((t.get("target") for t in delete_trigs if t.get("target")), None)
+            delete_succeeded = False
             try:
                 await message.delete()
+                delete_succeeded = True
                 notice = (
-                    f"🗑 Удалено ({_h(labels)}) — <b>{_h(chat_label)}</b>, {_h(sender)}{skip_note}:\n"
-                    f"<blockquote>{text_preview}</blockquote>"
+                    f"🗑 [{_h(engines)}] Удалено ({_h(labels)}{notify_note}) — "
+                    f"<b>{_h(chat_label)}</b>, {_h(sender)}{skip_note}:\n"
+                    f"<blockquote>{text_preview}</blockquote>{link_note}"
                 )
             except Exception as e:
                 notice = (
-                    f"⚠️ Хотел удалить ({_h(labels)}) — <b>{_h(chat_label)}</b>, {_h(sender)}, но не хватило "
-                    f"прав: {_h(str(e))}\n<blockquote>{text_preview}</blockquote>"
+                    f"⚠️ [{_h(engines)}] Удаление не выполнено ({_h(labels)}{notify_note}) — "
+                    f"<b>{_h(chat_label)}</b>, {_h(sender)}\nПричина: {_h(str(e))}\n"
+                    f"<blockquote>{text_preview}</blockquote>{link_note}"
                 )
             await self._notify_delete_report(target, delete_trigs[0].get("id", "?"), notice)
+            if confirm_trigs and not delete_succeeded:
+                await self._send_confirm_request(confirm_trigs[0], message, chat_label, sender, text_preview_raw)
             return
 
         if confirm_trigs:
@@ -2573,7 +2717,9 @@ class ClaudeAsk(loader.Module):
                     await self._notify_topic(
                         "moderation",
                         f"↩️ Автоответ ({_h(trig.get('label') or 'reply')}) — <b>{_h(chat_label)}</b>, "
-                        f"{_h(sender)}:\n<blockquote>{_h(canned)}</blockquote>",
+                        f"{_h(sender)}. Ответ отправлен."
+                        + (f" Notify: {_h(trig['_notify_labels'])}." if trig.get("_notify_labels") else "")
+                        + link_note,
                     )
                 except Exception as e:
                     await self._notify_topic("moderation", f"⚠️ Не смог автоответить: {_h(str(e))}")

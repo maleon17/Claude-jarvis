@@ -1,7 +1,7 @@
 # ClaudeAsk — .ask .search .translate + Jarvis persona, Claude backend
 # Rewrite of JarvisAsk (jarvis_ask.py): same UX (.ask/.search/.translate/.new,
 # in-place message editing so it looks like the user typed it themselves),
-# same "hosting connection" (Funnel HTTP endpoints -> cmd_queue.py -> queue
+# same "hosting connection" (HTTP endpoints -> cmd_queue.py -> queue
 # files), backend swapped to claude_watcher.py. See that file's docstring for
 # why most of the old 8-tool client marker surface is gone.
 #
@@ -44,18 +44,14 @@ from herokutl.errors import FloodWaitError, UserPrivacyRestrictedError, UserNotP
 from .. import loader, utils
 from .._internal import fw_protect
 
-# Direct tailnet address (this host's stable Tailscale IP), reached through
-# the local tailscaled userspace-networking proxy below -- NOT the public
-# Tailscale Funnel URL, which this userbot host's outbound path to the
-# funnel's edge IP range stopped completing TLS handshakes on (verified:
-# general internet fine, only that specific edge range affected).
-FUNNEL = os.environ.get("CLAUDE_JARVIS_FUNNEL", "http://100.98.146.81:9092")
+# Backend address, normally a private tailnet IP or a local address.
+BACKEND_URL = os.environ.get("CLAUDE_JARVIS_BACKEND_URL", "http://100.98.146.81:9092")
 
 # tailscaled on this userbot host runs with --tun=userspace-networking (no
 # /dev/net/tun in this container), so a plain socket connection never
 # reaches the tailnet at all -- everything has to go through its local HTTP
 # CONNECT proxy (--outbound-http-proxy-listen=localhost:1056). This is NOT
-# optional for this deployment: without it, FUNNEL above (a tailnet IP) is
+# optional for this deployment: without it, BACKEND_URL above (a tailnet IP) is
 # simply unreachable and every /ask request silently vanishes. Still
 # overridable/disableable via env var for a future host that doesn't need it.
 HTTP_PROXY = os.environ.get("CLAUDE_JARVIS_HTTP_PROXY", "http://localhost:1056")
@@ -64,10 +60,7 @@ if HTTP_PROXY:
         urllib.request.build_opener(urllib.request.ProxyHandler({"http": HTTP_PROXY}))
     )
 # Explicit now (was implicit -- claude_watcher.py defaulted a missing
-# instance_id to "andrey"), matching claude_ask_anatoly.py's structure
-# exactly. No functional change, just removes the one remaining asymmetry
-# between the two clients now that the backend's session-file naming no
-# longer special-cases this instance either (2026-08-04 symmetry pass).
+# instance_id to "andrey").
 INSTANCE_ID = os.environ.get("CLAUDE_JARVIS_INSTANCE_ID", "andrey")
 ENGINE = "claude"
 MAX_ROUNDS = 5  # mirrors claude_watcher.py's own round discipline
@@ -232,6 +225,8 @@ class ClaudeAsk(loader.Module):
     # -- Forum topics (Phase 1 infra) -----------------------------------------
 
     async def client_ready(self):
+        global BACKEND_URL, HTTP_PROXY, INSTANCE_ID
+
         self._topics = {}
         self._owner_id_cache = None
         # chat_id -> asyncio.Lock, serializes action=agent/reply trigger
@@ -249,8 +244,34 @@ class ClaudeAsk(loader.Module):
         # (which _reply_to_origin delivers silently via self._client) --
         # only the second case needs its own extra push.
         self._agent_turn_sent = {}
+        network = self.db.get("ClaudeAsk", "network", None)
+        if isinstance(network, dict):
+            BACKEND_URL = network.get("backend_url", BACKEND_URL)
+            HTTP_PROXY = network.get("http_proxy", HTTP_PROXY)
+            INSTANCE_ID = network.get("instance_id", INSTANCE_ID)
+            if HTTP_PROXY:
+                urllib.request.install_opener(
+                    urllib.request.build_opener(
+                        urllib.request.ProxyHandler({"http": HTTP_PROXY})
+                    )
+                )
+            else:
+                urllib.request.install_opener(urllib.request.build_opener())
         await self._ensure_topics()
-        await asyncio.to_thread(self._ensure_tailnet)
+        if HTTP_PROXY:
+            # Only instances that actually route through a local tailscaled
+            # proxy need it armed. A same-host/local-network instance (no
+            # proxy configured) has no business spawning it -- and may not
+            # even have the `tailscaled` binary installed at all.
+            try:
+                await asyncio.to_thread(self._ensure_tailnet)
+            except Exception:
+                # Best-effort startup optimization, not a hard requirement:
+                # if tailscaled can't be armed here (missing binary,
+                # permissions, ...), later HTTP calls through HTTP_PROXY will
+                # simply fail with their own clear timeout/connection error
+                # instead of silently taking the whole module load down.
+                pass
 
     def _agent_trigger_lock(self, chat_id):
         return self._agent_trigger_locks.setdefault(chat_id, asyncio.Lock())
@@ -292,7 +313,7 @@ class ClaudeAsk(loader.Module):
         in this container) on every module load. This container has no init
         system besides docker-init -- `python3 -m heroku` (which reloads this
         module) is the only thing guaranteed to run again after a container
-        restart, so the tailnet path FUNNEL relies on has to be re-armed from
+        restart, so the tailnet path BACKEND_URL relies on has to be re-armed from
         here, not from a systemd unit that doesn't exist. Idempotent: a live
         tailscaled is left alone.
         """
@@ -534,7 +555,7 @@ class ClaudeAsk(loader.Module):
 
         def upload():
             req = urllib.request.Request(
-                f"{FUNNEL}/upload", data=body,
+                f"{BACKEND_URL}/upload", data=body,
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
                 method="POST",
             )
@@ -948,7 +969,7 @@ class ClaudeAsk(loader.Module):
             data = json.dumps(payload).encode()
             urllib.request.urlopen(
                 urllib.request.Request(
-                    f"{FUNNEL}/ask", data=data,
+                    f"{BACKEND_URL}/ask", data=data,
                     headers={"Content-Type": "application/json"}, method="POST",
                 ),
                 timeout=5,
@@ -966,7 +987,7 @@ class ClaudeAsk(loader.Module):
         host, no funnel) while this side has to poll for work instead of
         being pushed to."""
         qs = urllib.parse.urlencode({"instance_id": INSTANCE_ID})
-        req = urllib.request.Request(f"{FUNNEL}/tool_call_pending?{qs}")
+        req = urllib.request.Request(f"{BACKEND_URL}/tool_call_pending?{qs}")
         with urllib.request.urlopen(req, timeout=5) as r:
             return json.loads(r.read())
 
@@ -974,7 +995,7 @@ class ClaudeAsk(loader.Module):
         data = json.dumps({"request_id": request_id, "result": result}).encode()
         urllib.request.urlopen(
             urllib.request.Request(
-                f"{FUNNEL}/tool_call_result", data=data,
+                f"{BACKEND_URL}/tool_call_result", data=data,
                 headers={"Content-Type": "application/json"}, method="POST",
             ),
             timeout=5,
@@ -985,7 +1006,7 @@ class ClaudeAsk(loader.Module):
         # chat), each with its own result file keyed by request_id -- the
         # relay needs to know which one to fetch.
         qs = urllib.parse.urlencode({"request_id": req_id})
-        req = urllib.request.Request(f"{FUNNEL}/ask?{qs}")
+        req = urllib.request.Request(f"{BACKEND_URL}/ask?{qs}")
         with urllib.request.urlopen(req, timeout=3) as r:
             return json.loads(r.read())
 
@@ -1109,7 +1130,7 @@ class ClaudeAsk(loader.Module):
 
             def fetch():
                 req = urllib.request.Request(
-                    f"{FUNNEL}/download?path={urllib.parse.quote(path)}"
+                    f"{BACKEND_URL}/download?path={urllib.parse.quote(path)}"
                 )
                 with urllib.request.urlopen(req, timeout=60) as r:
                     return r.read()
@@ -2141,7 +2162,7 @@ class ClaudeAsk(loader.Module):
         def call():
             data = json.dumps({"text": text[:2000], "condition": condition}).encode()
             req = urllib.request.Request(
-                f"{FUNNEL}/classify", data=data,
+                f"{BACKEND_URL}/classify", data=data,
                 headers={"Content-Type": "application/json"}, method="POST",
             )
             with urllib.request.urlopen(req, timeout=15) as r:
@@ -2975,7 +2996,11 @@ class ClaudeAsk(loader.Module):
             coordinator = self.lookup("JarvisAsk")
         except Exception:
             coordinator = None
-        if coordinator is not None:
+        # self.lookup() returns False, not None, when the module isn't
+        # loaded (confirmed live 2026-09-01 on an install without JarvisAsk
+        # loaded) -- a plain `is not None` check let that False through as
+        # if it were a real coordinator and crashed on .handle_message().
+        if coordinator:
             await coordinator.handle_message(message, ENGINE, self)
             return
         if not isinstance(message, Message):
@@ -3444,6 +3469,76 @@ class ClaudeAsk(loader.Module):
     # -- Commands -------------------------------------------------------------
 
     @loader.command()
+    async def asknet(self, message):
+        """Настроить instance_id, backend URL и HTTP proxy"""
+        global BACKEND_URL, HTTP_PROXY, INSTANCE_ID
+
+        work_message = await self._work_message(message)
+
+        def usage():
+            proxy = HTTP_PROXY or "disabled"
+            return (
+                "<b>.asknet</b> — настройка сети\n"
+                "<code>.asknet local &lt;instance_id&gt;</code>\n"
+                "<code>.asknet tailnet &lt;instance_id&gt; &lt;backend_url&gt;</code>\n"
+                "<code>.asknet custom &lt;instance_id&gt; &lt;backend_url&gt; &lt;proxy_url|none&gt;</code>\n\n"
+                f"instance_id: <code>{_h(INSTANCE_ID)}</code>\n"
+                f"backend_url: <code>{_h(BACKEND_URL)}</code>\n"
+                f"http_proxy: <code>{_h(proxy)}</code>"
+            )
+
+        args = utils.get_args_raw(message).split()
+        if not args:
+            await self._safe_edit(work_message, usage(), parse_mode="html")
+            return
+
+        mode = args[0].lower()
+        instance_id = args[1].strip() if len(args) > 1 else ""
+        backend_url = None
+        http_proxy = None
+        valid = bool(instance_id)
+        if mode == "local" and len(args) == 2:
+            backend_url = "http://127.0.0.1:9092"
+        elif mode == "tailnet" and len(args) == 3:
+            backend_url = args[2]
+            http_proxy = "http://localhost:1056"
+        elif mode == "custom" and len(args) == 4:
+            backend_url = args[2]
+            http_proxy = None if args[3].lower() == "none" else args[3]
+        else:
+            valid = False
+        if not backend_url or not backend_url.startswith(("http://", "https://")):
+            valid = False
+        if not valid:
+            await self._safe_edit(work_message, usage(), parse_mode="html")
+            return
+
+        BACKEND_URL = backend_url
+        HTTP_PROXY = http_proxy
+        INSTANCE_ID = instance_id
+        self.db.set("ClaudeAsk", "network", {
+            "instance_id": INSTANCE_ID,
+            "backend_url": BACKEND_URL,
+            "http_proxy": HTTP_PROXY,
+        })
+        if HTTP_PROXY:
+            urllib.request.install_opener(
+                urllib.request.build_opener(
+                    urllib.request.ProxyHandler({"http": HTTP_PROXY})
+                )
+            )
+        else:
+            urllib.request.install_opener(urllib.request.build_opener())
+        await self._safe_edit(
+            work_message,
+            "✅ Сетевая конфигурация применена\n"
+            f"instance_id: <code>{_h(INSTANCE_ID)}</code>\n"
+            f"backend_url: <code>{_h(BACKEND_URL)}</code>\n"
+            f"http_proxy: <code>{_h(HTTP_PROXY or 'disabled')}</code>",
+            parse_mode="html",
+        )
+
+    @loader.command()
     async def ask(self, message):
         """<вопрос> — спросить Jarvis"""
         # get_args_raw, NOT get_args: get_args runs the text through
@@ -3513,7 +3608,7 @@ class ClaudeAsk(loader.Module):
 
             def do_reset():
                 req = urllib.request.Request(
-                    f"{FUNNEL}/reset", data=data,
+                    f"{BACKEND_URL}/reset", data=data,
                     headers={"Content-Type": "application/json"}, method="POST",
                 )
                 with urllib.request.urlopen(req, timeout=5) as r:

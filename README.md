@@ -9,11 +9,9 @@
 ## Состав
 
 - `claude_ask.py` — основной загружаемый модуль ClaudeAsk;
-- `claude_ask_anatoly.py` — изолированный вариант для второго userbot-инстанса;
 - `claude_watcher.py` — Claude Code backend с постоянными сессиями;
 - `mcp_telegram_tools.py` — MCP-инструменты действий аккаунта Telegram;
 - `cmd_queue.py` — общий HTTP queue relay для `.ask` и `.xask`;
-- `funnel_ask_router.py` — опциональный path-router для Tailscale Funnel;
 - `setup.sh` и service examples — подготовка backend-инфраструктуры.
 
 ## Команды
@@ -34,8 +32,8 @@ Telethon-сессия, выполняет действие и возвращае
 ответ пользователю.
 
 Queue relay — инфраструктурный транспорт. Если на хосте уже работают
-`jarvis-ask-cmd-queue.service` и `jarvis-ask-funnel-router.service`, не запускай
-вторую копию на тех же портах и каталогах.
+`jarvis-ask-cmd-queue.service`, не запускай вторую копию на тех же портах и
+каталогах.
 
 ## Установка backend-а
 
@@ -56,13 +54,16 @@ runtime-каталог. Сервисные шаблоны требуют зам�
 
 ## Загрузка модуля
 
-Отправь `claude_ask.py` документом в выделенный тестовый Telegram-канал и
-ответь на документ `.lm`. Для второго userbot-инстанса загружается
-`claude_ask_anatoly.py`. После загрузки проверь `.ask`, `.new` и запрос с
-реальным инструментом (`list_triggers`, `read_history` или `search_chat`).
+Отправь один и тот же `claude_ask.py` документом в выделенный тестовый
+Telegram-канал каждого userbot-инстанса и ответь на документ `.lm`. Затем один
+раз в чате соответствующего аккаунта выполни `.asknet local <instance_id>` или
+`.asknet tailnet <instance_id> <backend_url>`. Настройки сохраняются при
+последующих обновлениях через `.dlm`. После загрузки проверь `.ask`, `.new` и
+запрос с реальным инструментом (`list_triggers`, `read_history` или
+`search_chat`).
 
 Сетевой адрес queue relay и Mistral-ключ для голосовой расшифровки задаются
-переменными окружения (`CLAUDE_JARVIS_FUNNEL`, `MISTRAL_API_KEY`); секреты в
+переменными окружения (`CLAUDE_JARVIS_BACKEND_URL`, `MISTRAL_API_KEY`); секреты в
 репозитории не хранятся.
 
 ## Проверка и обновление
@@ -73,8 +74,18 @@ systemctl status jarvis-ask-watcher
 journalctl -u jarvis-ask-watcher -f
 ```
 
-Обновление userbot-модуля делается через документ + `.lm`; простой `docker cp`
-не перезагружает уже работающий модуль.
+Простой `docker cp` не перезагружает уже работающий модуль.
+
+## Обновление
+
+Загруженный модуль переустанавливается на месте из последней версии в `main`:
+
+```text
+.dlm https://raw.githubusercontent.com/maleon17/Claude-jarvis/main/claude_ask.py
+```
+
+Сохранённая для каждого инстанса конфигурация `.asknet` остаётся в базе Heroku,
+поэтому повторно настраивать сеть после обновления не нужно.
 
 ## Граница продуктов
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Command + Ask + OCR queue for Hermes server."""
+"""Command + Ask + OCR queue for jarvis-ask."""
 
 import json
 import os
@@ -39,22 +39,22 @@ def _sessions_enc_file(instance_id):
     return os.path.join(_JARVIS_ASK_DIR, f"ask_sessions_{instance_id}.enc")
 
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-QUEUE_FILE = "/tmp/hermes_cmd_queue.json"
-RESULT_FILE = "/tmp/hermes_cmd_result.json"
+QUEUE_FILE = "/tmp/jarvisask_cmd_queue.json"
+RESULT_FILE = "/tmp/jarvisask_cmd_result.json"
 # Per-request_id files (not single shared files) -- claude_watcher.py now
 # processes multiple .ask calls concurrently (one thread per chat), so a
 # single shared queue/result file would let concurrent requests clobber
 # each other's state.
-ASK_QUEUE_DIR = os.environ.get("JARVIS_ASK_QUEUE_DIR", "/tmp/hermes_ask_queue/")
-ASK_RESULT_DIR = os.environ.get("JARVIS_ASK_RESULT_DIR", "/tmp/hermes_ask_result/")
+ASK_QUEUE_DIR = os.environ.get("JARVIS_ASK_QUEUE_DIR", "/tmp/jarvisask_ask_queue/")
+ASK_RESULT_DIR = os.environ.get("JARVIS_ASK_RESULT_DIR", "/tmp/jarvisask_ask_result/")
 os.makedirs(ASK_QUEUE_DIR, exist_ok=True)
 os.makedirs(ASK_RESULT_DIR, exist_ok=True)
 # CodexAsk uses a separate queue so Claude and Codex workers can never race
 # to claim each other's requests. The HTTP server remains shared because it
 # is transport infrastructure, not a model backend.
-XASK_QUEUE_DIR = os.environ.get("JARVIS_XASK_QUEUE_DIR", "/tmp/hermes_xask_queue/")
-XASK_RESULT_DIR = os.environ.get("JARVIS_XASK_RESULT_DIR", "/tmp/hermes_xask_result/")
-XASK_RESET_DIR = os.environ.get("JARVIS_XASK_RESET_DIR", "/tmp/hermes_xask_reset/")
+XASK_QUEUE_DIR = os.environ.get("JARVIS_XASK_QUEUE_DIR", "/tmp/jarvisask_xask_queue/")
+XASK_RESULT_DIR = os.environ.get("JARVIS_XASK_RESULT_DIR", "/tmp/jarvisask_xask_result/")
+XASK_RESET_DIR = os.environ.get("JARVIS_XASK_RESET_DIR", "/tmp/jarvisask_xask_reset/")
 for _path in (XASK_QUEUE_DIR, XASK_RESULT_DIR, XASK_RESET_DIR):
     os.makedirs(_path, exist_ok=True)
 
@@ -66,8 +66,8 @@ for _path in (XASK_QUEUE_DIR, XASK_RESULT_DIR, XASK_RESET_DIR):
 # action, and posts the result to /tool_call_result. Per-request_id files,
 # same reasoning as ASK_QUEUE_DIR/ASK_RESULT_DIR -- concurrent tool calls
 # (e.g. two different chats both mid-.ask) must not clobber each other.
-TOOL_QUEUE_DIR = os.environ.get("JARVIS_TOOL_QUEUE_DIR", "/tmp/hermes_tool_queue/")
-TOOL_RESULT_DIR = os.environ.get("JARVIS_TOOL_RESULT_DIR", "/tmp/hermes_tool_result/")
+TOOL_QUEUE_DIR = os.environ.get("JARVIS_TOOL_QUEUE_DIR", "/tmp/jarvisask_tool_queue/")
+TOOL_RESULT_DIR = os.environ.get("JARVIS_TOOL_RESULT_DIR", "/tmp/jarvisask_tool_result/")
 os.makedirs(TOOL_QUEUE_DIR, exist_ok=True)
 os.makedirs(TOOL_RESULT_DIR, exist_ok=True)
 _TOOL_QUEUE_LOCK = threading.Lock()
@@ -113,6 +113,18 @@ def _pop_pending_tool_call(instance_id: str):
         return None
 
 
+# Distinct from a genuine "unsure" verdict: "unsure" means the model looked
+# at the condition and text and couldn't confidently say yes/no -- a real
+# answer that still escalates to a human via the confirm flow. This sentinel
+# means the classify call itself never got a real answer at all (queue write
+# failed, or claude_watcher.py/codex_ask_watcher.py never produced a result
+# within the timeout -- e.g. the account's flat-subscription limit is hit).
+# claude_ask.py/codex_ask.py's _classify_condition checks for this and
+# retries via the OTHER engine's classify endpoint before ever collapsing to
+# a real "unsure" -- see the 2026-08-30 engine-routing unification.
+CLASSIFY_UNAVAILABLE = "__unavailable__"
+
+
 def classify_semantic(text: str, condition: str, timeout: float = 25.0) -> str:
     """Tier 1 trigger classifier (Phase 4): a cheap 3-way call ("yes"/"no"/
     "unsure") for conditions that don't reduce to a keyword/link/button
@@ -151,7 +163,7 @@ def classify_semantic(text: str, condition: str, timeout: float = 25.0) -> str:
                 "mode": "classify", "ts": time.time(), "done": False,
             }, f)
     except Exception:
-        return "unsure"
+        return CLASSIFY_UNAVAILABLE
 
     result_path = os.path.join(ASK_RESULT_DIR, f"{req_id}.json")
     deadline = time.time() + timeout
@@ -179,7 +191,60 @@ def classify_semantic(text: str, condition: str, timeout: float = 25.0) -> str:
                     return "no"
                 return "unsure"
         time.sleep(0.3)
-    return "unsure"
+    return CLASSIFY_UNAVAILABLE
+
+
+def classify_semantic_codex(text: str, condition: str, timeout: float = 25.0) -> str:
+    """Codex-side sibling of classify_semantic above -- same Tier 1 trigger
+    classifier contract (3-way yes/no/unsure), same reasoning for why it's
+    routed through the flat-subscription queue instead of a metered API
+    (Codex CLI is ChatGPT-subscription auth too, not per-token billing).
+    There's no Haiku equivalent on the Codex side, so this uses whatever
+    codex_ask_watcher.py's CODEX_CLASSIFY_MODEL is configured to (gpt-5.4
+    as of 2026-08-29) -- routed through XASK_QUEUE_DIR/XASK_RESULT_DIR
+    (codex_ask_watcher.py's own queue, not claude_watcher.py's) tagged
+    mode="classify", which codex_ask_watcher.py handles with a bare
+    classify prompt, no persona, no session resume. Kept as a fully
+    separate function rather than parameterizing classify_semantic --
+    matches this file's existing convention of duplicating client-specific
+    logic rather than sharing it (see claude_ask.py vs claude_ask_anatoly.py)."""
+    if not condition or not text:
+        return "unsure"
+    req_id = str(uuid.uuid4())
+    prompt = (
+        "Условие: " + condition + "\n\nСообщение: " + text[:2000]
+    )
+    try:
+        with open(os.path.join(XASK_QUEUE_DIR, f"{req_id}.json"), "w") as f:
+            json.dump({
+                "question": prompt, "chat_id": "classify", "instance_id": "andrey_codex",
+                "request_id": req_id, "mode": "classify", "ts": time.time(), "done": False,
+            }, f)
+    except Exception:
+        return CLASSIFY_UNAVAILABLE
+
+    result_path = os.path.join(XASK_RESULT_DIR, f"{req_id}.json")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(result_path):
+            try:
+                with open(result_path) as f:
+                    data = json.load(f)
+            except Exception:
+                data = None
+            if data and data.get("done"):
+                try:
+                    os.remove(result_path)
+                except FileNotFoundError:
+                    pass
+                answer = (data.get("answer") or "").strip().lower()
+                if answer.startswith(("да", "yes")):
+                    return "yes"
+                if answer.startswith(("нет", "no")):
+                    return "no"
+                return "unsure"
+        time.sleep(0.3)
+    return CLASSIFY_UNAVAILABLE
 
 
 def ocr_image(b64: str, question: str = "Извлеки весь текст с этого изображения.") -> str | None:
@@ -329,6 +394,10 @@ class Queue(BaseHTTPRequestHandler):
 
         elif self.path == "/classify":
             result = classify_semantic(body.get("text", ""), body.get("condition", ""))
+            self._json({"result": result})
+
+        elif self.path == "/xclassify":
+            result = classify_semantic_codex(body.get("text", ""), body.get("condition", ""))
             self._json({"result": result})
 
         elif self.path == "/xreset":

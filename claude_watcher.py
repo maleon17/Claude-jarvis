@@ -84,8 +84,8 @@ MCP_CONFIG_PATH = os.environ.get(
 # concurrently (one thread per request), matching cmd_queue.py's ASK_QUEUE_DIR/
 # ASK_RESULT_DIR on the relay side. A single shared file would let concurrent
 # requests overwrite each other's queue entry or progress/result.
-QUEUE_DIR = os.environ.get("CLAUDE_JARVIS_ASK_QUEUE", "/tmp/hermes_ask_queue/")
-RESULT_DIR = os.environ.get("CLAUDE_JARVIS_ASK_RESULT", "/tmp/hermes_ask_result/")
+QUEUE_DIR = os.environ.get("CLAUDE_JARVIS_ASK_QUEUE", "/tmp/jarvisask_ask_queue/")
+RESULT_DIR = os.environ.get("CLAUDE_JARVIS_ASK_RESULT", "/tmp/jarvisask_ask_result/")
 os.makedirs(QUEUE_DIR, exist_ok=True)
 os.makedirs(RESULT_DIR, exist_ok=True)
 SESSIONS_LOCK = threading.Lock()

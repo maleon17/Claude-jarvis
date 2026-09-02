@@ -27,7 +27,7 @@ aren't duplicated.
 
 The userbot module sends a request to `/ask`, the worker processes it
 through Claude Code and returns a progress/answer stream via
-`/tmp/hermes_ask_*`. MCP calls land in `/tmp/hermes_tool_queue`; the module
+`/tmp/jarvisask_ask_*`. MCP calls land in `/tmp/jarvisask_tool_queue`; the module
 holding a live Telethon session executes the action and returns the result.
 Every action gets a real tool result first, and only then is it reflected
 in the reply to the user.
@@ -40,10 +40,12 @@ second copy on the same ports/directories.
 
 Requirements: Linux, Python 3.10+, the Claude Code CLI authenticated via
 `claude auth login --claudeai`, systemd (for running as a service). The
-userbot itself must be installed separately on a Telethon/Hikka host — this
-project targets the [Heroku](https://github.com/coddrago/Heroku) userbot;
-follow its own README for installing and starting the userbot before
-loading `claude_ask.py` into it.
+userbot itself must be installed separately — this project targets the
+[Heroku](https://github.com/coddrago/Heroku) userbot; follow its own README
+for installing and starting the userbot before loading `claude_ask.py` into
+it. Heroku can run on a dedicated Telethon/Hikka host or in Docker on the
+same machine as this backend — running it on a separate host is just this
+deployment's own choice, not a requirement.
 
 ```bash
 git clone https://github.com/maleon17/Claude-jarvis.git

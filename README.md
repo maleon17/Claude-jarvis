@@ -1,45 +1,46 @@
 # Claude Jarvis
 
-Отдельный Telegram userbot/backend для ClaudeAsk. Он позволяет владельцу
-вызывать Jarvis командой `.ask` в любом чате Telegram и выполнять реальные
-действия своей Telethon-сессией. Это не Bot API bridge и не Codex Jarvis.
+A standalone Telegram userbot/backend for ClaudeAsk. It lets the owner
+invoke Jarvis with the `.ask` command in any Telegram chat and perform real
+actions through their own Telethon session. This is not the Bot API bridge
+and not Codex Jarvis.
 
-Репозиторий: <https://github.com/maleon17/Claude-jarvis>
+Repository: <https://github.com/maleon17/Claude-jarvis>
 
-## Состав
+## Components
 
-- `claude_ask.py` — основной загружаемый модуль ClaudeAsk;
-- `claude_watcher.py` — Claude Code backend с постоянными сессиями;
-- `mcp_telegram_tools.py` — MCP-инструменты действий аккаунта Telegram;
-- `cmd_queue.py` — общий HTTP queue relay для `.ask` и `.xask`;
-- `setup.sh` и service examples — подготовка backend-инфраструктуры.
+- `claude_ask.py` — the main loadable ClaudeAsk module;
+- `claude_watcher.py` — the Claude Code backend with persistent sessions;
+- `mcp_telegram_tools.py` — MCP tools for Telegram account actions;
+- `cmd_queue.py` — the shared HTTP queue relay for `.ask` and `.xask`;
+- `setup.sh` and service examples — backend infrastructure setup.
 
-## Команды
+## Commands
 
-ClaudeAsk использует `.ask`, `.search`, `.translate` и `.new`. Триггеры
-хранятся в namespace `ClaudeAsk`. CodexAsk использует отдельный namespace
-истории и команды с префиксом `x`, но намеренно читает тот же namespace
-триггеров; watcher входящих сообщений остаётся единственным, поэтому триггеры
-не дублируются.
+ClaudeAsk uses `.ask`, `.search`, `.translate`, and `.new`. Triggers are
+stored in the `ClaudeAsk` namespace. CodexAsk uses a separate history
+namespace and `x`-prefixed commands, but deliberately reads the same trigger
+namespace; the incoming-message watcher stays a single one, so triggers
+aren't duplicated.
 
-## Архитектура
+## Architecture
 
-Модуль userbot отправляет запрос в `/ask`, worker обрабатывает его через
-Claude Code и возвращает поток прогресса/ответа через `/tmp/hermes_ask_*`.
-MCP-вызовы попадают в `/tmp/hermes_tool_queue`; модуль, у которого есть живая
-Telethon-сессия, выполняет действие и возвращает результат. Все действия
-сначала получают реальный результат инструмента, и только затем попадают в
-ответ пользователю.
+The userbot module sends a request to `/ask`, the worker processes it
+through Claude Code and returns a progress/answer stream via
+`/tmp/hermes_ask_*`. MCP calls land in `/tmp/hermes_tool_queue`; the module
+holding a live Telethon session executes the action and returns the result.
+Every action gets a real tool result first, and only then is it reflected
+in the reply to the user.
 
-Queue relay — инфраструктурный транспорт. Если на хосте уже работают
-`jarvis-ask-cmd-queue.service`, не запускай вторую копию на тех же портах и
-каталогах.
+The queue relay is shared infrastructure transport. If
+`jarvis-ask-cmd-queue.service` is already running on the host, don't start a
+second copy on the same ports/directories.
 
-## Установка backend-а
+## Backend installation
 
-Требования: Linux, Python 3.10+, Claude Code CLI с авторизацией
-`claude auth login --claudeai`, systemd (для сервисного запуска). Userbot
-должен быть установлен отдельно на Telethon/Hikka host.
+Requirements: Linux, Python 3.10+, the Claude Code CLI authenticated via
+`claude auth login --claudeai`, systemd (for running as a service). The
+userbot itself must be installed separately on a Telethon/Hikka host.
 
 ```bash
 git clone https://github.com/maleon17/Claude-jarvis.git
@@ -48,25 +49,26 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
-Скрипт создаёт MCP virtualenv, локальный `mcp_telegram_tools_config.json` и
-runtime-каталог. Сервисные шаблоны требуют замены `__USER__` и
-`__INSTALL_DIR__`; queue relay следует устанавливать только один раз на хост.
+The script creates the MCP virtualenv, a local
+`mcp_telegram_tools_config.json`, and a runtime directory. Service templates
+need `__USER__` and `__INSTALL_DIR__` replaced; the queue relay should only
+be installed once per host.
 
-## Загрузка модуля
+## Loading the module
 
-Отправь один и тот же `claude_ask.py` документом в выделенный тестовый
-Telegram-канал каждого userbot-инстанса и ответь на документ `.lm`. Затем один
-раз в чате соответствующего аккаунта выполни `.asknet local <instance_id>` или
-`.asknet tailnet <instance_id> <backend_url>`. Настройки сохраняются при
-последующих обновлениях через `.dlm`. После загрузки проверь `.ask`, `.new` и
-запрос с реальным инструментом (`list_triggers`, `read_history` или
-`search_chat`).
+Send the same `claude_ask.py` as a document to each userbot instance's
+dedicated test Telegram channel and reply to the document with `.lm`. Then,
+once per account, run `.asknet local <instance_id>` or
+`.asknet tailnet <instance_id> <backend_url>`. Settings persist across later
+updates via `.dlm`. After loading, verify `.ask`, `.new`, and a request that
+uses a real tool (`list_triggers`, `read_history`, or `search_chat`).
 
-Сетевой адрес queue relay и Mistral-ключ для голосовой расшифровки задаются
-переменными окружения (`CLAUDE_JARVIS_BACKEND_URL`, `MISTRAL_API_KEY`); секреты в
-репозитории не хранятся.
+The queue relay's network address and the Mistral key for voice
+transcription are set via environment variables
+(`CLAUDE_JARVIS_BACKEND_URL`, `MISTRAL_API_KEY`); no secrets are stored in
+the repository.
 
-## Проверка и обновление
+## Verification and updates
 
 ```bash
 python3 -m py_compile claude_watcher.py cmd_queue.py mcp_telegram_tools.py
@@ -74,25 +76,27 @@ systemctl status jarvis-ask-watcher
 journalctl -u jarvis-ask-watcher -f
 ```
 
-Простой `docker cp` не перезагружает уже работающий модуль.
+A plain `docker cp` does not reload an already-running module.
 
-## Обновление
+## Updating
 
-Загруженный модуль переустанавливается на месте из последней версии в `main`:
+The loaded module reinstalls itself in place from the latest version on
+`main`:
 
 ```text
 .dlm https://raw.githubusercontent.com/maleon17/Claude-jarvis/main/claude_ask.py
 ```
 
-Сохранённая для каждого инстанса конфигурация `.asknet` остаётся в базе Heroku,
-поэтому повторно настраивать сеть после обновления не нужно.
+Each instance's saved `.asknet` configuration stays in Heroku's database, so
+there's no need to reconfigure the network after an update.
 
-## Граница продуктов
+## Product boundaries
 
-`Claude-jarvis` — ClaudeAsk/userbot. `Codex-jarvis` — независимый CodexAsk и
-его app-server. `Codex-telegram-bot` — ещё один независимый Bot API frontend.
-Только queue relay и namespace правил триггеров намеренно общие.
+`Claude-jarvis` is ClaudeAsk/the userbot. `Codex-jarvis` is the independent
+CodexAsk and its app-server. `Codex-telegram-bot` is yet another independent
+Bot API frontend. Only the queue relay and the trigger namespace are
+deliberately shared.
 
-## Лицензия
+## License
 
 MIT, Copyright (c) 2026 maleon17.

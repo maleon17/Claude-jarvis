@@ -28,7 +28,7 @@
 #
 # GPL AGPLv3
 
-import asyncio, html, io, json, os, re, shutil, subprocess, tempfile, time, urllib.request, urllib.parse, uuid
+import asyncio, html, json, os, re, shutil, subprocess, tempfile, time, urllib.request, urllib.parse, uuid
 from datetime import datetime, timezone
 
 from herokutl.tl.functions.channels import ToggleForumRequest, InviteToChannelRequest, GetParticipantRequest
@@ -152,6 +152,43 @@ def _h(text):
     return html.escape(text or "", quote=False)
 
 
+# --- persona pager (ported from the owner's Remaker .vim editor) -----------
+_PERSONA_ZWSP = "​"
+_PERSONA_PAGE_MAX = 3600  # Telegram text limit is 4096; headroom for <pre> + guards
+
+
+def _persona_pre(content):
+    """Editable page body: <pre> block guarded against Telegram whitespace trim."""
+    return f"{_PERSONA_ZWSP}<pre>{_h(content)}</pre>{_PERSONA_ZWSP}"
+
+
+def _persona_unguard(text):
+    return (text or "").strip(_PERSONA_ZWSP)
+
+
+def _persona_split(content):
+    """Split into message-sized chunks on line boundaries. Every chunk keeps a
+    trailing "\\n", so "".join(pages) reproduces the original (bar one final
+    newline the caller strips)."""
+    chunks, current = [], ""
+    for line in content.split("\n"):
+        piece = line + "\n"
+        while len(piece) > _PERSONA_PAGE_MAX:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(piece[:_PERSONA_PAGE_MAX])
+            piece = piece[_PERSONA_PAGE_MAX:]
+        if len(current) + len(piece) > _PERSONA_PAGE_MAX:
+            chunks.append(current)
+            current = piece
+        else:
+            current += piece
+    if current:
+        chunks.append(current)
+    return chunks or [""]
+
+
 # Homoglyph table for keyword-trigger matching (Phase 4): common Cyrillic/
 # Latin lookalikes collapse to one canonical (Cyrillic) form before the
 # substring check, so a keyword written in Cyrillic still catches someone
@@ -248,6 +285,8 @@ class ClaudeAsk(loader.Module):
         # (which _reply_to_origin delivers silently via self._client) --
         # only the second case needs its own extra push.
         self._agent_turn_sent = {}
+        # sid -> {pages, index, chat_id, code_msg_id, form} for the .persona pager
+        self._persona_sessions = {}
         network = self.db.get("ClaudeAsk", "network", None)
         if isinstance(network, dict):
             BACKEND_URL = network.get("backend_url", BACKEND_URL)
@@ -3747,9 +3786,8 @@ class ClaudeAsk(loader.Module):
 
     @loader.command()
     async def persona(self, message):
-        """[reset] — показать/сменить персону Jarvis (ответом на файл или текст — задать новую)"""
+        """[reset] — редактор персоны Jarvis: без аргументов постранично (◀️ ▶️ / ✅), ответом на файл или текст — заменить целиком"""
         arg = utils.get_args_raw(message).strip()
-        chat_id = message.chat_id
         loop = asyncio.get_running_loop()
 
         if arg.lower() == "reset":
@@ -3762,9 +3800,9 @@ class ClaudeAsk(loader.Module):
                 await self._safe_edit(work_message, f"❌ {_h(str(e))}", parse_mode="html")
             return
 
-        # New persona from a reply (document or text) or from inline text.
-        new_text = None
+        # Reply to a document or a text message -> replace the whole persona.
         reply = await message.get_reply_message()
+        new_text = None
         if reply is not None and reply.document:
             if (getattr(reply.document, "size", 0) or 0) > 256 * 1024:
                 work_message = await self._work_message(message)
@@ -3774,12 +3812,10 @@ class ClaudeAsk(loader.Module):
                 new_text = (await reply.download_media(bytes)).decode("utf-8")
             except Exception as e:
                 work_message = await self._work_message(message)
-                await self._safe_edit(work_message, f"❌ Файл не прочитан как UTF-8 текст: {_h(str(e))}", parse_mode="html")
+                await self._safe_edit(work_message, f"❌ Файл не прочитан как UTF-8: {_h(str(e))}", parse_mode="html")
                 return
         elif reply is not None and (reply.raw_text or "").strip():
             new_text = reply.raw_text
-        elif arg:
-            new_text = arg
 
         if new_text is not None:
             work_message = await self._work_message(message)
@@ -3789,44 +3825,196 @@ class ClaudeAsk(loader.Module):
             try:
                 res = await loop.run_in_executor(None, lambda: self._persona_http(
                     "POST", "/persona", {"instance_id": INSTANCE_ID, "persona": new_text}))
-                ok = res.get("status") == "ok"
-                icon = "✅" if ok else "❌"
+                icon = "✅" if res.get("status") == "ok" else "❌"
                 await self._safe_edit(work_message, f"{icon} {_h(res.get('message', 'Готово'))}", parse_mode="html")
             except Exception as e:
                 await self._safe_edit(work_message, f"❌ {_h(str(e))}", parse_mode="html")
             return
 
-        # No args, no reply -> hand back the current persona as an editable file.
-        # Only in a private chat: the file has the owner name/id substituted in,
-        # no need to drop that into a group.
+        # No args, no reply -> paged in-place editor.
         if not getattr(message, "is_private", False):
             work_message = await self._work_message(message)
-            await self._safe_edit(work_message, "❌ Показ персоны — только в личке с ботом. Здесь работают <code>.persona reset</code> и ответ на файл/текст.", parse_mode="html")
+            await self._safe_edit(
+                work_message,
+                "❌ Постраничный редактор — только в личном чате. В группе: <code>.persona reset</code> "
+                "или ответ на файл/текст.",
+                parse_mode="html",
+            )
             return
+        await self._persona_editor_open(message)
+
+    # -- .persona paged editor (ported from the owner's Remaker .vim pager) --
+
+    async def _persona_editor_open(self, message):
+        loop = asyncio.get_running_loop()
         try:
             res = await loop.run_in_executor(None, lambda: self._persona_http(
                 "GET", f"/persona?instance_id={urllib.parse.quote(INSTANCE_ID)}"))
         except Exception as e:
-            work_message = await self._work_message(message)
-            await self._safe_edit(work_message, f"❌ {_h(str(e))}", parse_mode="html")
+            wm = await self._work_message(message)
+            await self._safe_edit(wm, f"❌ {_h(str(e))}", parse_mode="html")
             return
-        text = res.get("persona") or ""
-        source = {
-            "instance": "кастомная", "default": "локальный default.md",
-            "template": "шаблон из репозитория", "missing": "не найдена",
-        }.get(res.get("source"), str(res.get("source")))
-        buf = io.BytesIO(text.encode("utf-8"))
-        buf.name = f"persona_{INSTANCE_ID}.md"
-        await message.client.send_file(
-            chat_id, buf, reply_to=message.id, force_document=True,
-            caption=(
-                f"📄 Текущая персона ({_h(source)}, {len(text)} симв.).\n"
-                f"Отредактируй и пришли обратно ответом на файл: <code>.persona</code>\n"
-                f"Вернуть шаблон: <code>.persona reset</code>"
-            ),
-            parse_mode="html",
+        pages = _persona_split((res.get("persona") or "").rstrip("\n"))
+        sid = uuid.uuid4().hex
+        code_out = await message.client.send_message(
+            message.chat_id, _persona_pre(pages[0]), reply_to=message.id,
         )
+        session = {
+            "sid": sid, "pages": pages, "index": 0,
+            "chat_id": message.chat_id, "code_msg_id": code_out.id,
+        }
+        # small gap so the (inline-bot) panel lands under the heavy <pre> message
+        await asyncio.sleep(0.4)
+        form, err = await self._persona_make_form(
+            message, self._persona_panel_text(session), self._persona_buttons(session),
+        )
+        if not form:
+            try:
+                await code_out.delete()
+            except Exception:
+                pass
+            await message.client.send_message(
+                message.chat_id,
+                f"❌ Инлайн-бот недоступен, редактор не открыть.\n<code>{_h(str(err))}</code>",
+            )
+            return
+        session["form"] = form
+        self._persona_sessions[sid] = session
+
+    async def _persona_make_form(self, target, panel_text, buttons):
+        inline = getattr(self, "inline", None)
+        if not inline:
+            return None, "self.inline недоступен"
+        last_err = None
+        for kw in ({"message": target, "parse_mode": "html"}, {"message": target}):
+            try:
+                form = await inline.form(text=panel_text, reply_markup=buttons, **kw)
+                if form:
+                    return form, None
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+        return None, last_err
+
+    async def _persona_call_edit(self, target, text, buttons):
+        for variant in (
+            {"text": text, "reply_markup": buttons, "parse_mode": "html"},
+            {"text": text, "reply_markup": buttons},
+        ):
+            try:
+                await target.edit(**variant)
+                return True
+            except Exception:
+                continue
+        return False
+
+    def _persona_panel_text(self, s):
+        return (
+            f"✏️ <b>Персона Jarvis</b> — страница {s['index'] + 1}/{len(s['pages'])}\n"
+            "<i>Правь сообщение над панелью, листай ◀️ ▶️, потом «✅ Сохранить». "
+            "«❌ Отмена» — выйти без изменений.</i>"
+        )
+
+    def _persona_buttons(self, s):
+        sid, i, n = s["sid"], s["index"], len(s["pages"])
+        return [
+            [
+                {"text": "◀️", "callback": self._cb_persona_prev, "args": (sid,)},
+                {"text": f"{i + 1}/{n}", "callback": self._cb_persona_noop},
+                {"text": "▶️", "callback": self._cb_persona_next, "args": (sid,)},
+            ],
+            [
+                {"text": "✅ Сохранить", "callback": self._cb_persona_save, "args": (sid,)},
+                {"text": "❌ Отмена", "callback": self._cb_persona_cancel, "args": (sid,)},
+            ],
+        ]
+
+    async def _persona_ack(self, call, text=None, alert=False):
         try:
-            await message.delete()
+            await call.answer(text, show_alert=alert) if text else await call.answer()
         except Exception:
             pass
+
+    async def _persona_persist_page(self, s):
+        """Read the live edited code message back into pages[index]."""
+        try:
+            msg = await self._client.get_messages(s["chat_id"], ids=s["code_msg_id"])
+        except Exception:
+            return
+        if msg:
+            s["pages"][s["index"]] = _persona_unguard(msg.raw_text or "")
+
+    async def _cb_persona_noop(self, call):
+        await self._persona_ack(call)
+
+    async def _cb_persona_prev(self, call, sid):
+        await self._persona_nav(call, sid, -1)
+
+    async def _cb_persona_next(self, call, sid):
+        await self._persona_nav(call, sid, +1)
+
+    async def _persona_nav(self, call, sid, direction):
+        s = self._persona_sessions.get(sid)
+        if not s:
+            await self._persona_ack(call, "Сессия истекла — открой .persona заново", alert=True)
+            return
+        await self._persona_persist_page(s)
+        new_index = s["index"] + direction
+        if new_index < 0 or new_index >= len(s["pages"]):
+            await self._persona_ack(call, "Это край")
+            return
+        s["index"] = new_index
+        try:
+            await self._client.edit_message(
+                s["chat_id"], s["code_msg_id"], _persona_pre(s["pages"][new_index]),
+            )
+        except Exception:
+            pass
+        await self._persona_call_edit(call, self._persona_panel_text(s), self._persona_buttons(s))
+        await self._persona_ack(call)
+
+    async def _cb_persona_cancel(self, call, sid):
+        s = self._persona_sessions.pop(sid, None)
+        if s:
+            try:
+                await self._client.edit_message(
+                    s["chat_id"], s["code_msg_id"], "↩️ <b>Правка персоны отменена.</b>",
+                )
+            except Exception:
+                pass
+        try:
+            await call.delete()
+        except Exception:
+            pass
+        await self._persona_ack(call, "Отменено")
+
+    async def _cb_persona_save(self, call, sid):
+        s = self._persona_sessions.get(sid)
+        if not s:
+            await self._persona_ack(call, "Сессия истекла — открой .persona заново", alert=True)
+            return
+        await self._persona_persist_page(s)
+        new_text = "".join(s["pages"]).rstrip("\n")
+        loop = asyncio.get_running_loop()
+        try:
+            res = await loop.run_in_executor(None, lambda: self._persona_http(
+                "POST", "/persona", {"instance_id": INSTANCE_ID, "persona": new_text}))
+            ok = res.get("status") == "ok"
+            msg = res.get("message", "")
+        except Exception as e:
+            ok, msg = False, str(e)
+        if not ok:
+            # keep the draft and the panel so the owner can fix and retry
+            await self._persona_ack(call, f"❌ {msg}"[:190], alert=True)
+            return
+        self._persona_sessions.pop(sid, None)
+        try:
+            await self._client.edit_message(
+                s["chat_id"], s["code_msg_id"], f"✅ <b>Персона обновлена.</b> {_h(msg)}",
+            )
+        except Exception:
+            pass
+        try:
+            await call.delete()
+        except Exception:
+            pass
+        await self._persona_ack(call, "Сохранено")

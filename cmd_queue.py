@@ -84,6 +84,64 @@ def _safe_instance_id(value):
     return isinstance(value, str) and bool(_SAFE_INSTANCE_RE.fullmatch(value))
 
 
+# Editable persona files, shared with claude_watcher.py / codex_ask_watcher.py
+# (their load_persona()). Point $JARVIS_PERSONA_DIR at the watcher's repo dir
+# if this relay runs from a different directory than the watcher.
+PERSONA_DIR = os.environ.get(
+    "JARVIS_PERSONA_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "personas"),
+)
+PERSONA_TEMPLATE = os.path.join(PERSONA_DIR, "default.md.example")
+_PERSONA_MAX_BYTES = 64 * 1024
+_PERSONA_READ_CAP = 256 * 1024
+_PERSONA_OWNER_NAME = os.environ.get("JARVIS_OWNER_NAME", "владелец")
+_PERSONA_OWNER_TG_ID = os.environ.get("JARVIS_OWNER_TG_ID", "")
+
+
+def _persona_has_control_chars(text):
+    # A persona is fed to the model as a system prompt / prompt prefix and, on
+    # the Claude side, passed as a --system-prompt argv value. A NUL makes that
+    # Popen call fail on every later request; other C0 controls have no place
+    # in a persona. Tab / newline / CR are fine.
+    return any(ord(c) < 0x20 and c not in "\t\n\r" for c in text)
+
+
+def _persona_path(instance_id):
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", instance_id or "default")
+    return os.path.join(PERSONA_DIR, safe + ".md")
+
+
+def _persona_open_regular(path):
+    """Read a persona file, refusing to follow a symlink -- a persona file must
+    be a regular file, never a pointer to something else."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(fd, "r", encoding="utf-8") as fh:
+        return fh.read(_PERSONA_READ_CAP + 1)
+
+
+def _persona_read(instance_id):
+    """Return (text, source): source is 'instance', 'default', 'template' or
+    'missing' -- the same lookup order and {{OWNER_*}} filling the watchers use,
+    so a GET shows exactly what the model receives."""
+    for path, source in (
+        (_persona_path(instance_id), "instance"),
+        (os.path.join(PERSONA_DIR, "default.md"), "default"),
+        (PERSONA_TEMPLATE, "template"),
+    ):
+        try:
+            text = _persona_open_regular(path)
+        except (OSError, UnicodeError):
+            continue
+        if len(text) > _PERSONA_READ_CAP:
+            continue
+        text = (text.replace("{{OWNER_NAME}}", _PERSONA_OWNER_NAME)
+                    .replace("{{OWNER_TG_ID}}", _PERSONA_OWNER_TG_ID))
+        if not text.strip():
+            continue  # empty -> fall through, matching the watchers' load_persona
+        return text, source
+    return "", "missing"
+
+
 def _pop_pending_tool_call(instance_id: str):
     """Atomically claim one pending tool call for this instance -- under
     ThreadingHTTPServer, two overlapping /tool_call_pending polls (unlikely
@@ -411,6 +469,55 @@ class Queue(BaseHTTPRequestHandler):
                 json.dump({"chat_id": str(chat_id), "instance_id": instance_id}, f)
             self._json({"status": "ok", "message": f"Codex-сессия чата {chat_id} будет сброшена"})
 
+        elif self.path in ("/persona", "/xpersona"):
+            # Write (or reset) an instance's editable persona file. The watcher
+            # re-reads it on mtime change, so the change lands on the next
+            # .ask/.xask with no restart. Owner-only in practice: the only
+            # caller is the userbot's own owner-scoped .persona/.xpersona
+            # command.
+            instance_id = body.get("instance_id") or ""
+            if not _safe_instance_id(instance_id):
+                self._json({"status": "error", "message": "Некорректный instance_id"})
+                return
+            os.makedirs(PERSONA_DIR, exist_ok=True)
+            target = _persona_path(instance_id)
+            if body.get("reset"):
+                try:
+                    os.remove(target)
+                    self._json({"status": "ok", "message": "Персона сброшена к шаблону"})
+                except FileNotFoundError:
+                    self._json({"status": "ok", "message": "Персона уже дефолтная"})
+                return
+            text = body.get("persona")
+            if not isinstance(text, str) or not text.strip():
+                self._json({"status": "error", "message": "Пустая персона"})
+                return
+            if _persona_has_control_chars(text):
+                self._json({"status": "error", "message": "Недопустимые управляющие символы в персоне"})
+                return
+            payload = text.strip() + "\n"
+            try:
+                payload_bytes = len(payload.encode("utf-8"))
+            except UnicodeEncodeError:
+                self._json({"status": "error", "message": "Персона содержит недопустимые символы Unicode"})
+                return
+            if payload_bytes > _PERSONA_MAX_BYTES:
+                self._json({"status": "error", "message": "Персона слишком большая"})
+                return
+            tmp = f"{target}.tmp{uuid.uuid4().hex}"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(payload)
+                os.replace(tmp, target)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            self._json({"status": "ok", "message": "Персона обновлена, применится со следующего запроса"})
+
         elif self.path == "/reset":
             chat_id = body.get("chat_id", "")
             if chat_id:
@@ -520,6 +627,15 @@ class Queue(BaseHTTPRequestHandler):
             else:
                 self._json({"stdout": "", "stderr": "", "rc": -1})
 
+        elif self.path.startswith("/persona") or self.path.startswith("/xpersona"):
+            qs = urllib.parse.urlparse(self.path).query
+            instance_id = urllib.parse.parse_qs(qs).get("instance_id", [""])[0]
+            if not _safe_instance_id(instance_id):
+                self._json({"status": "error", "message": "Некорректный instance_id"})
+                return
+            text, source = _persona_read(instance_id)
+            self._json({"status": "ok", "persona": text, "source": source})
+
         elif self.path.startswith("/ask") or self.path.startswith("/xask"):
             # Always return the file's actual contents, not just when
             # done -- lets a "progress" field (live thought/tool-call
@@ -568,9 +684,24 @@ class Queue(BaseHTTPRequestHandler):
                     pass
             self._json({"done": False, "result": None})
 
+    _MAX_JSON_BODY = 1 * 1024 * 1024  # every JSON endpoint here takes small bodies
+
     def _body(self):
-        length = int(self.headers.get("Content-Length", 0))
-        return json.loads(self.rfile.read(length)) if length else {}
+        # Bound and validate before parsing: an unbounded Content-Length would
+        # let a client tie up a thread / memory, and a malformed or non-object
+        # body used to raise straight out of the handler. Callers already treat
+        # a missing field as an error, so {} is a safe "bad body" return.
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            return {}
+        if length <= 0 or length > self._MAX_JSON_BODY:
+            return {}
+        try:
+            parsed = json.loads(self.rfile.read(length))
+        except (ValueError, OSError, RecursionError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
 
     def _json(self, data):
         body = json.dumps(data).encode()

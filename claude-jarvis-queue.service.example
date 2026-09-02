@@ -9,6 +9,9 @@ Type=simple
 User=__USER__
 WorkingDirectory=__INSTALL_DIR__
 Environment=PATH=/home/__USER__/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Optional: owner name/id for the persona template, and chats where the
+# persona's profanity is suppressed. Written by setup.sh; '-' = ok if absent.
+EnvironmentFile=-__INSTALL_DIR__/jarvis.env
 Environment=JARVIS_ASK_DIR=__INSTALL_DIR__/runtime
 ExecStart=/usr/bin/python3 -u __INSTALL_DIR__/cmd_queue.py
 Restart=always

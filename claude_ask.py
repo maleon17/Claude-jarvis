@@ -28,7 +28,7 @@
 #
 # GPL AGPLv3
 
-import asyncio, html, json, os, re, shutil, subprocess, tempfile, time, urllib.request, urllib.parse, uuid
+import asyncio, html, io, json, os, re, shutil, subprocess, tempfile, time, urllib.request, urllib.parse, uuid
 from datetime import datetime, timezone
 
 from herokutl.tl.functions.channels import ToggleForumRequest, InviteToChannelRequest, GetParticipantRequest
@@ -3736,3 +3736,97 @@ class ClaudeAsk(loader.Module):
             await self._safe_edit(work_message, f"🧹 {result.get('message', 'Новая сессия')}", parse_mode="html")
         except Exception as e:
             await self._safe_edit(work_message, f"❌ Ошибка сброса: {e}")
+
+    def _persona_http(self, method, path, payload=None):
+        # Blocking; call via run_in_executor. Mirrors .new's do_reset pattern.
+        data = json.dumps(payload).encode() if payload is not None else None
+        headers = {"Content-Type": "application/json"} if data else {}
+        req = urllib.request.Request(f"{BACKEND_URL}{path}", data=data, headers=headers, method=method)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+
+    @loader.command()
+    async def persona(self, message):
+        """[reset] — показать/сменить персону Jarvis (ответом на файл или текст — задать новую)"""
+        arg = utils.get_args_raw(message).strip()
+        chat_id = message.chat_id
+        loop = asyncio.get_running_loop()
+
+        if arg.lower() == "reset":
+            work_message = await self._work_message(message)
+            try:
+                res = await loop.run_in_executor(None, lambda: self._persona_http(
+                    "POST", "/persona", {"instance_id": INSTANCE_ID, "reset": True}))
+                await self._safe_edit(work_message, f"♻️ {_h(res.get('message', 'Сброшено к шаблону'))}", parse_mode="html")
+            except Exception as e:
+                await self._safe_edit(work_message, f"❌ {_h(str(e))}", parse_mode="html")
+            return
+
+        # New persona from a reply (document or text) or from inline text.
+        new_text = None
+        reply = await message.get_reply_message()
+        if reply is not None and reply.document:
+            if (getattr(reply.document, "size", 0) or 0) > 256 * 1024:
+                work_message = await self._work_message(message)
+                await self._safe_edit(work_message, "❌ Файл слишком большой для персоны (лимит ~64 КБ текста).")
+                return
+            try:
+                new_text = (await reply.download_media(bytes)).decode("utf-8")
+            except Exception as e:
+                work_message = await self._work_message(message)
+                await self._safe_edit(work_message, f"❌ Файл не прочитан как UTF-8 текст: {_h(str(e))}", parse_mode="html")
+                return
+        elif reply is not None and (reply.raw_text or "").strip():
+            new_text = reply.raw_text
+        elif arg:
+            new_text = arg
+
+        if new_text is not None:
+            work_message = await self._work_message(message)
+            if not new_text.strip():
+                await self._safe_edit(work_message, "❌ Пустая персона.")
+                return
+            try:
+                res = await loop.run_in_executor(None, lambda: self._persona_http(
+                    "POST", "/persona", {"instance_id": INSTANCE_ID, "persona": new_text}))
+                ok = res.get("status") == "ok"
+                icon = "✅" if ok else "❌"
+                await self._safe_edit(work_message, f"{icon} {_h(res.get('message', 'Готово'))}", parse_mode="html")
+            except Exception as e:
+                await self._safe_edit(work_message, f"❌ {_h(str(e))}", parse_mode="html")
+            return
+
+        # No args, no reply -> hand back the current persona as an editable file.
+        # Only in a private chat: the file has the owner name/id substituted in,
+        # no need to drop that into a group.
+        if not getattr(message, "is_private", False):
+            work_message = await self._work_message(message)
+            await self._safe_edit(work_message, "❌ Показ персоны — только в личке с ботом. Здесь работают <code>.persona reset</code> и ответ на файл/текст.", parse_mode="html")
+            return
+        try:
+            res = await loop.run_in_executor(None, lambda: self._persona_http(
+                "GET", f"/persona?instance_id={urllib.parse.quote(INSTANCE_ID)}"))
+        except Exception as e:
+            work_message = await self._work_message(message)
+            await self._safe_edit(work_message, f"❌ {_h(str(e))}", parse_mode="html")
+            return
+        text = res.get("persona") or ""
+        source = {
+            "instance": "кастомная", "default": "локальный default.md",
+            "template": "шаблон из репозитория", "missing": "не найдена",
+        }.get(res.get("source"), str(res.get("source")))
+        buf = io.BytesIO(text.encode("utf-8"))
+        buf.name = f"persona_{INSTANCE_ID}.md"
+        await message.client.send_file(
+            chat_id, buf, reply_to=message.id, force_document=True,
+            caption=(
+                f"📄 Текущая персона ({_h(source)}, {len(text)} симв.).\n"
+                f"Отредактируй и пришли обратно ответом на файл: <code>.persona</code>\n"
+                f"Вернуть шаблон: <code>.persona reset</code>"
+            ),
+            parse_mode="html",
+        )
+        try:
+            await message.delete()
+        except Exception:
+            pass

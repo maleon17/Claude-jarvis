@@ -40,7 +40,10 @@ second copy on the same ports/directories.
 
 Requirements: Linux, Python 3.10+, the Claude Code CLI authenticated via
 `claude auth login --claudeai`, systemd (for running as a service). The
-userbot itself must be installed separately on a Telethon/Hikka host.
+userbot itself must be installed separately on a Telethon/Hikka host — this
+project targets the [Heroku](https://github.com/coddrago/Heroku) userbot;
+follow its own README for installing and starting the userbot before
+loading `claude_ask.py` into it.
 
 ```bash
 git clone https://github.com/maleon17/Claude-jarvis.git

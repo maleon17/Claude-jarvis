@@ -84,14 +84,16 @@ def _safe_instance_id(value):
     return isinstance(value, str) and bool(_SAFE_INSTANCE_RE.fullmatch(value))
 
 
-# Editable persona files, shared with claude_watcher.py / codex_ask_watcher.py
-# (their load_persona()). Point $JARVIS_PERSONA_DIR at the watcher's repo dir
-# if this relay runs from a different directory than the watcher.
+# Editable persona files, shared with the watchers' load_persona(). Each
+# backend has its own directory: /persona -> $JARVIS_PERSONA_DIR (Claude
+# watcher), /xpersona -> $JARVIS_XPERSONA_DIR (Codex watcher). $JARVIS_XPERSONA_DIR
+# defaults to $JARVIS_PERSONA_DIR, so point it at codex_ask_watcher.py's own
+# personas/ dir whenever the two watchers live in different repos.
 PERSONA_DIR = os.environ.get(
     "JARVIS_PERSONA_DIR",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "personas"),
 )
-PERSONA_TEMPLATE = os.path.join(PERSONA_DIR, "default.md.example")
+XPERSONA_DIR = os.environ.get("JARVIS_XPERSONA_DIR", PERSONA_DIR)
 _PERSONA_MAX_BYTES = 64 * 1024
 _PERSONA_READ_CAP = 256 * 1024
 _PERSONA_OWNER_NAME = os.environ.get("JARVIS_OWNER_NAME", "владелец")
@@ -106,9 +108,14 @@ def _persona_has_control_chars(text):
     return any(ord(c) < 0x20 and c not in "\t\n\r" for c in text)
 
 
-def _persona_path(instance_id):
+def _persona_dir_for(path):
+    """/xpersona -> Codex persona dir, everything else -> Claude persona dir."""
+    return XPERSONA_DIR if path.startswith("/xpersona") else PERSONA_DIR
+
+
+def _persona_path(persona_dir, instance_id):
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", instance_id or "default")
-    return os.path.join(PERSONA_DIR, safe + ".md")
+    return os.path.join(persona_dir, safe + ".md")
 
 
 def _persona_open_regular(path):
@@ -119,14 +126,14 @@ def _persona_open_regular(path):
         return fh.read(_PERSONA_READ_CAP + 1)
 
 
-def _persona_read(instance_id):
+def _persona_read(persona_dir, instance_id):
     """Return (text, source): source is 'instance', 'default', 'template' or
     'missing' -- the same lookup order and {{OWNER_*}} filling the watchers use,
     so a GET shows exactly what the model receives."""
     for path, source in (
-        (_persona_path(instance_id), "instance"),
-        (os.path.join(PERSONA_DIR, "default.md"), "default"),
-        (PERSONA_TEMPLATE, "template"),
+        (_persona_path(persona_dir, instance_id), "instance"),
+        (os.path.join(persona_dir, "default.md"), "default"),
+        (os.path.join(persona_dir, "default.md.example"), "template"),
     ):
         try:
             text = _persona_open_regular(path)
@@ -479,8 +486,9 @@ class Queue(BaseHTTPRequestHandler):
             if not _safe_instance_id(instance_id):
                 self._json({"status": "error", "message": "Некорректный instance_id"})
                 return
-            os.makedirs(PERSONA_DIR, exist_ok=True)
-            target = _persona_path(instance_id)
+            persona_dir = _persona_dir_for(self.path)
+            os.makedirs(persona_dir, exist_ok=True)
+            target = _persona_path(persona_dir, instance_id)
             if body.get("reset"):
                 try:
                     os.remove(target)
@@ -633,7 +641,7 @@ class Queue(BaseHTTPRequestHandler):
             if not _safe_instance_id(instance_id):
                 self._json({"status": "error", "message": "Некорректный instance_id"})
                 return
-            text, source = _persona_read(instance_id)
+            text, source = _persona_read(_persona_dir_for(self.path), instance_id)
             self._json({"status": "ok", "persona": text, "source": source})
 
         elif self.path.startswith("/ask") or self.path.startswith("/xask"):

@@ -1,6 +1,6 @@
 [Unit]
 Description=Claude Jarvis backend worker
-Documentation=https://github.com/maleon17/Claude-jarvis
+Documentation=https://github.com/maleon17/claude-ask
 After=network-online.target
 Wants=network-online.target
 

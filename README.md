@@ -1,11 +1,13 @@
-# Claude Jarvis
+# claude-ask
+
+> Part of **[telegram-ai](https://github.com/maleon17/telegram-ai)** — Claude/Codex ↔ Telegram, four ways.
 
 A standalone Telegram userbot/backend for ClaudeAsk. It lets the owner
 invoke Jarvis with the `.ask` command in any Telegram chat and perform real
 actions through their own Telethon session. This is not the Bot API bridge
-and not Codex Jarvis.
+and not codex-ask.
 
-Repository: <https://github.com/maleon17/Claude-jarvis>
+Repository: <https://github.com/maleon17/claude-ask>
 
 ## Components
 
@@ -48,8 +50,8 @@ same machine as this backend — running it on a separate host is just this
 deployment's own choice, not a requirement.
 
 ```bash
-git clone https://github.com/maleon17/Claude-jarvis.git
-cd Claude-jarvis
+git clone https://github.com/maleon17/claude-ask.git
+cd claude-ask
 chmod +x setup.sh
 ./setup.sh
 ```
@@ -89,7 +91,7 @@ The loaded module reinstalls itself in place from the latest version on
 `main`:
 
 ```text
-.dlm https://raw.githubusercontent.com/maleon17/Claude-jarvis/main/claude_ask.py
+.dlm https://raw.githubusercontent.com/maleon17/claude-ask/main/claude_ask.py
 ```
 
 Each instance's saved `.asknet` configuration stays in Heroku's database, so
